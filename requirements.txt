@@ -6,3 +6,4 @@ mongoengine==0.28.2
 pymongo==4.7.3
 pytz==2024.1
 python-dotenv==1.0.1
+gunicorn==22.0.0

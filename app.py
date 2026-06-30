@@ -127,6 +127,12 @@ def splitpart(value, index, separator):
     return value
 
 
+@app.route('/')
+@app.route('/health')
+def health_check():
+    return jsonify({'status': 'ok', 'service': 'map-backend'}), 200
+
+
 @app.route('/uploads/<path:filename>')
 def serve_upload(filename):
     return send_from_directory('uploads', filename)
@@ -277,11 +283,23 @@ def newCompany(org_id, user_id):
     return True
 
 
+def _backend_logo_url():
+    return f"{app_config.BASE_URL.rstrip('/')}/uploads/logo.png"
+
+
+def _client_app_url(path=''):
+    base = app_config.CLIENT_APP_URL
+    if not base:
+        return ''
+    path = (path or '').lstrip('/')
+    return f"{base}/{path}" if path else base
+
+
 def render_auth_email(template_name, user_id, **template_context):
     return render_template(
         template_name,
-        logo=f"{app_config.REDIRECT_URL}LOGOmap.png",
-        reset_password_url=f"{app_config.ACCOUNTS_URL}reset-password?user_id={user_id}",
+        logo=_backend_logo_url(),
+        reset_password_url=_client_app_url(f'reset-password?user_id={user_id}'),
         **template_context,
     )
 
@@ -438,12 +456,12 @@ def userSignUp():
 
         organization = MongoAPI.organizationInfo(org_id)
 
-        logo = f'{app_config.ACCOUNTS_URL}LOGOmap.png'
+        logo = _backend_logo_url()
         otp_verification_mail = render_template(
             'signup_verification_code.html',
             verify_otp=verify_otp,
             logo=logo,
-            REDIRECT_URI=f'{app_config.ACCOUNTS_URL}configuration',
+            REDIRECT_URI=_client_app_url('configuration'),
         )
 
         str_id = str(org_id)
@@ -713,11 +731,8 @@ def add_lead():
         user_details = Uid.fix_array5(user_details)
         user_id = user_details.get('user_id')
 
-        logo = (
-            f"{app_config.ACCOUNTS_mapON_URL}"
-            'assets/images/brand-logos/map-logo-dark.png'
-        )
-        lead_detail_url = f"{app_config.REDIRECT_URL}lead_detail/{lead_list_id}"
+        logo = _backend_logo_url()
+        lead_detail_url = _client_app_url(f'lead_detail/{lead_list_id}')
 
         sales_lead_reminder = render_template(
             'sales_lead_reminder_org.html',
@@ -3002,7 +3017,7 @@ def crm_tasks_submit():
         assoc_id_str = normalize_id(assoc_id)
         subject_prefix = module.replace('_', ' ').title() if module else 'Task'
         display_name = ''
-        detail_url = app_config.REDIRECT_URL
+        detail_url = _client_app_url()
         template_company_id = assoc_id_str
 
         try:
@@ -3011,7 +3026,7 @@ def crm_tasks_submit():
                 if isinstance(lead_detail, list):
                     lead_detail = lead_detail[0] if lead_detail else {}
                 display_name = lead_detail.get("name", '')
-                detail_url = f"{app_config.REDIRECT_URL}lead_detail/{assoc_id_str}"
+                detail_url = _client_app_url(f'lead_detail/{assoc_id_str}')
             else:
                 return None
         except Exception as exc:
@@ -3025,7 +3040,7 @@ def crm_tasks_submit():
         return {
             'subject': subject,
             'display_name': display_name,
-            'detail_url': detail_url or app_config.REDIRECT_URL,
+            'detail_url': detail_url or _client_app_url(),
             'template_company_id': template_company_id or assoc_id_str,
         }
 
@@ -3035,10 +3050,7 @@ def crm_tasks_submit():
     user_id = user_details.get("user_id")
     user_details = Uid.fix_array5(user_details)
 
-    logo = (
-        f"{app_config.ACCOUNTS_mapON_URL}"
-        'assets/images/brand-logos/map-logo-dark.png'
-    )
+    logo = _backend_logo_url()
 
     if email_context:
         sales_task_reminder = render_template(
@@ -3049,7 +3061,7 @@ def crm_tasks_submit():
             time=time,
             company_id=email_context.get('template_company_id', ''),
             logo=logo,
-            company_detail_url=email_context.get('detail_url', app_config.REDIRECT_URL),
+            company_detail_url=email_context.get('detail_url', _client_app_url()),
         )
     else:
         sales_task_reminder = None

@@ -1,8 +1,7 @@
 import url_config
 
-REDIRECT_URL = url_config.REDIRECT_URL
-ACCOUNTS_URL = url_config.ACCOUNTS_URL
-ACCOUNTS_mapON_URL = url_config.ACCOUNTS_URL
+BASE_URL = url_config.BASE_URL
+CLIENT_APP_URL = url_config.CLIENT_APP_URL
 TEMPLATE_FOLDER = 'templates/'
 DEFAULT_FROM_EMAIL = 'noreply@map.local'
 
@@ -110,8 +109,6 @@ settingsLookup = {
 }
 
 order_dict = {'asc': 1, 'desc': -1}
-
-BASE_URL = url_config.BASE_URL
 
 UPLOAD_OPEN_EMAIL_FOLDER = 'uploads/email/'
 UPLOAD_OPEN_DOCUMENT_FOLDER = 'uploads/document/'

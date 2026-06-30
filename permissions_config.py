@@ -1,6 +1,6 @@
 """Permission keys for role-based access control.
 
-Field names must match the frontend permissions-modules config and are stored
+Permission keys are stored
 as 0/1 integers on Role documents.
 """
 
