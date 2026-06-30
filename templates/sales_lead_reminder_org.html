@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Lead Reminder</title>
+</head>
+<body style="font-family: Arial, sans-serif; color: #333; line-height: 1.5;">
+  <div style="max-width: 600px; margin: 0 auto; padding: 24px;">
+    {% if logo %}
+    <img src="{{ logo }}" alt="Logo" style="max-width: 180px; margin-bottom: 24px;">
+    {% endif %}
+
+    <h2 style="margin: 0 0 16px;">New Lead Assigned</h2>
+    <p>A new lead has been created and assigned to you.</p>
+
+    <table style="width: 100%; border-collapse: collapse; margin: 20px 0;">
+      <tr>
+        <td style="padding: 8px 0; font-weight: bold; width: 140px;">Lead Name</td>
+        <td style="padding: 8px 0;">{{ lead_name or '-' }}</td>
+      </tr>
+      <tr>
+        <td style="padding: 8px 0; font-weight: bold;">Company</td>
+        <td style="padding: 8px 0;">{{ company_name or '-' }}</td>
+      </tr>
+      <tr>
+        <td style="padding: 8px 0; font-weight: bold;">Phone</td>
+        <td style="padding: 8px 0;">{{ phone_no or '-' }}</td>
+      </tr>
+      <tr>
+        <td style="padding: 8px 0; font-weight: bold;">Email</td>
+        <td style="padding: 8px 0;">{{ email or '-' }}</td>
+      </tr>
+      <tr>
+        <td style="padding: 8px 0; font-weight: bold;">Description</td>
+        <td style="padding: 8px 0;">{{ description or '-' }}</td>
+      </tr>
+    </table>
+
+    {% if lead_detail_url %}
+    <p>
+      <a href="{{ lead_detail_url }}" style="display: inline-block; background: #2563eb; color: #fff; text-decoration: none; padding: 10px 18px; border-radius: 6px;">
+        View Lead Details
+      </a>
+    </p>
+    {% endif %}
+  </div>
+</body>
+</html>
