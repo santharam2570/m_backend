@@ -2203,6 +2203,9 @@ class MongoAPI:
                 if field in data1 and data1[field] is None:
                     data1[field] = []
 
+            if 'price_per_cent' in data1 and data1['price_per_cent'] is not None:
+                data1['price_per_cent'] = str(data1['price_per_cent'])
+
             numeric_fields = (
                 'price_per_sqft', 'price_range_min', 'price_range_max',
                 'budget_min', 'budget_max',
@@ -2372,6 +2375,8 @@ class MongoAPI:
                         settings[field] = float(value) if 'price' in field or 'budget' in field else int(value)
                     except (TypeError, ValueError):
                         continue
+                elif field == 'price_per_cent':
+                    settings[field] = str(value)
                 else:
                     settings[field] = value
 
