@@ -17,6 +17,7 @@ from pytz import timezone
 from werkzeug.utils import secure_filename
 
 import app_config
+from ai_chat import AiChatError, process_chat_request
 from common_config import Uid
 from db import initialize_db
 from jwt_auth import (
@@ -136,6 +137,38 @@ def health_check():
 @app.route('/uploads/<path:filename>')
 def serve_upload(filename):
     return send_from_directory('uploads', filename)
+
+
+@app.route('/ai_chat', methods=['POST'])
+@jwt_required()
+def ai_chat():
+    current_user = get_jwt_identity()
+    user = MongoAPI.authorizationCheck(current_user)
+    org_id = user.get('org_id')
+    if not org_id:
+        return jsonify({"msg": "Oops,Something went wrong !", "code": 400})
+
+    if not request.is_json:
+        return jsonify({"msg": "Missing JSON in request", "code": 400})
+
+    body = request.json or {}
+    message = (body.get('message') or '').strip()
+    if not message:
+        return jsonify({"msg": "Missing message parameter", "code": 400})
+
+    history = body.get('history') or []
+    context = body.get('context') or {'type': 'general'}
+
+    try:
+        reply = process_chat_request(
+            int(org_id), message, history, current_user, context, user,
+        )
+    except AiChatError as exc:
+        return jsonify({"msg": str(exc), "code": 503}), 503
+    except Exception:
+        return jsonify({"msg": "AI service unavailable", "code": 503}), 503
+
+    return jsonify({"code": 200, "data": {"reply": reply}})
 
 
 def extract_list_params(
@@ -2023,6 +2056,47 @@ def lead_update(id):
         return jsonify({"msg": "Lead successfully Updated !","code": 200,"data": data})
     else:
         return jsonify({"msg": "Oops,Something went wrong !","code": 400})
+
+
+@app.route('/lead_suggested_projects/<id>', methods=['GET', 'PUT'])
+@jwt_required()
+def lead_suggested_projects(id):
+    current_user = get_jwt_identity()
+    user = MongoAPI.authorizationCheck(current_user)
+
+    ordId = user.get('org_id')
+    if not ordId:
+        return jsonify({"msg": "Oops,Something went wrong !", "code": 400})
+
+    org_id = int(ordId)
+
+    if request.method == 'GET':
+        project_ids = MongoAPI.get_lead_suggested_projects(org_id, id)
+        return jsonify({
+            "msg": "Suggested projects fetched successfully!",
+            "code": 200,
+            "data": project_ids,
+        })
+
+    if not request.is_json:
+        return jsonify({"msg": "Missing JSON in request", "code": 400})
+
+    if not MongoAPI.user_has_permission(org_id, current_user, 'edit_lead'):
+        return jsonify({
+            'msg': "You don't have permission to edit leads",
+            'code': 403,
+        }), 403
+
+    project_ids = request.json.get('suggested_projects', [])
+    response = MongoAPI.update_lead_suggested_projects(org_id, id, project_ids)
+    if response and response != '0':
+        return jsonify({
+            "msg": "Suggested projects updated successfully!",
+            "code": 200,
+            "data": project_ids,
+        })
+
+    return jsonify({"msg": "Oops,Something went wrong !", "code": 400})
 
 
 def _lead_associates_response(org_id, lead_id, current_user):

@@ -1668,6 +1668,356 @@ class MongoAPI:
             match_filter['assigned_to'] = ObjectId('000000000000000000000000')
 
     @staticmethod
+    def _lead_no_search_candidates(lead_no):
+        raw = (lead_no or '').strip()
+        if not raw:
+            return []
+
+        candidates = {raw}
+        match = re.match(r'^([A-Za-z]+)[\s\-/]+(\d+)$', raw, re.I)
+        if match:
+            prefix = match.group(1).upper()
+            sequence = match.group(2)
+            for separator in ('/', '-', ' '):
+                candidates.add(f'{prefix}{separator}{sequence}')
+        return list(candidates)
+
+    @staticmethod
+    def get_lead_id_by_lead_no(org_id, lead_no, current_user):
+        candidates = MongoAPI._lead_no_search_candidates(lead_no)
+        if not candidates:
+            return None
+
+        for candidate in candidates:
+            match_filter = {
+                'org_id': int(org_id),
+                'status': 'active',
+                'lead_no': {'$regex': f'^{re.escape(candidate)}$', '$options': 'i'},
+            }
+            MongoAPI._apply_lead_visibility_filter(match_filter, org_id, current_user)
+            lead = Lead.objects(__raw__=match_filter).only('id').first()
+            if lead:
+                return str(lead.id)
+        return None
+
+    @staticmethod
+    def search_leads_for_chat(org_id, search_text, current_user, limit=5):
+        text = (search_text or '').strip()
+        if not text:
+            return []
+
+        match_filter = {
+            'org_id': int(org_id),
+            'status': 'active',
+        }
+        MongoAPI._apply_lead_visibility_filter(match_filter, org_id, current_user)
+
+        or_conditions = []
+        digits = re.sub(r'\D', '', text)
+        if len(digits) >= 7:
+            phone_regex = {'$regex': re.escape(digits), '$options': 'i'}
+            or_conditions.extend([
+                {'phone': phone_regex},
+                {'alternate_phone': phone_regex},
+                {'whatsapp_no': phone_regex},
+            ])
+
+        if '@' in text:
+            or_conditions.append({'email': {'$regex': re.escape(text), '$options': 'i'}})
+
+        name_regex = MongoAPI._flexible_search_regex(text) or {
+            '$regex': re.escape(text), '$options': 'i',
+        }
+        or_conditions.extend([
+            {'name': name_regex},
+            {'company_name': name_regex},
+            {'lead_no': name_regex},
+            {'project_name': name_regex},
+        ])
+
+        match_filter['$or'] = or_conditions
+        leads = Lead.objects(__raw__=match_filter).only('id', 'name', 'lead_no', 'phone', 'company_name')[:limit]
+        return [
+            {
+                'id': str(lead.id),
+                'name': lead.name or '',
+                'lead_no': lead.lead_no or '',
+                'phone': lead.phone or '',
+                'company_name': lead.company_name or '',
+            }
+            for lead in leads
+        ]
+
+    @staticmethod
+    def get_project_id_by_project_no(org_id, project_no, current_user):
+        candidates = MongoAPI._lead_no_search_candidates(project_no)
+        if not candidates:
+            return None
+
+        for candidate in candidates:
+            project = Project.objects(
+                org_id=int(org_id),
+                project_no={'$regex': f'^{re.escape(candidate)}$', '$options': 'i'},
+            ).only('id').first()
+            if project:
+                return str(project.id)
+        return None
+
+    @staticmethod
+    def _normalize_numeric_value(text):
+        cleaned = re.sub(r'[^\d.]', '', str(text or ''))
+        if not cleaned:
+            return None
+        try:
+            return float(cleaned)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def search_projects_by_price_for_chat(org_id, price_value, current_user, limit=5):
+        price_value = MongoAPI._normalize_numeric_value(price_value)
+        if not price_value or price_value <= 0:
+            return []
+
+        tolerance = max(1.0, price_value * 0.001)
+        low = price_value - tolerance
+        high = price_value + tolerance
+        price_text = str(int(price_value)) if price_value == int(price_value) else str(price_value)
+
+        projects = Project.objects(__raw__={
+            'org_id': int(org_id),
+            '$or': [
+                {'price_per_sqft': {'$gte': low, '$lte': high}},
+                {
+                    'price_range_min': {'$lte': high},
+                    'price_range_max': {'$gte': low},
+                },
+                {'price_per_cent': {'$regex': re.escape(price_text), '$options': 'i'}},
+            ],
+        }).only(
+            'id', 'name', 'project_no', 'location', 'status',
+            'price_per_sqft', 'price_per_cent',
+        )[:limit]
+
+        matches = []
+        seen_ids = set()
+        for project in projects:
+            project_id = str(project.id)
+            if project_id in seen_ids:
+                continue
+
+            matched = False
+            sqft = project.price_per_sqft or 0
+            if sqft and low <= sqft <= high:
+                matched = True
+            cent_value = MongoAPI._normalize_numeric_value(project.price_per_cent)
+            if cent_value and low <= cent_value <= high:
+                matched = True
+            if matched:
+                seen_ids.add(project_id)
+                matches.append({
+                    'id': project_id,
+                    'name': project.name or '',
+                    'project_no': project.project_no or '',
+                    'location': project.location or '',
+                    'status': project.status or '',
+                    'price_per_sqft': project.price_per_sqft or 0,
+                    'price_per_cent': project.price_per_cent or '',
+                })
+        return matches[:limit]
+
+    @staticmethod
+    def _flexible_search_regex(text):
+        text = (text or '').strip()
+        if not text:
+            return None
+        parts = [re.escape(part) for part in text.split() if part]
+        if not parts:
+            return None
+        if len(parts) == 1:
+            return {'$regex': parts[0], '$options': 'i'}
+        return {'$regex': r'\s+'.join(parts), '$options': 'i'}
+
+    @staticmethod
+    def get_leads_for_project_for_chat(org_id, project_id, current_user, limit=50):
+        try:
+            project = Project.objects.get(id=ObjectId(project_id), org_id=int(org_id))
+        except (Project.DoesNotExist, InvalidId):
+            return []
+
+        project_oid = ObjectId(project_id)
+        project_name = (project.name or '').strip()
+        leads_by_id = {}
+
+        match_filter = {
+            'org_id': int(org_id),
+            'status': 'active',
+        }
+        MongoAPI._apply_lead_visibility_filter(match_filter, org_id, current_user)
+
+        or_conditions = [{'suggested_projects': project_oid}]
+        name_regex = MongoAPI._flexible_search_regex(project_name)
+        if name_regex:
+            or_conditions.append({'project_name': name_regex})
+
+        match_filter['$or'] = or_conditions
+        direct_leads = Lead.objects(__raw__=match_filter).only(
+            'id', 'name', 'lead_no', 'phone', 'company_name', 'location', 'project_name',
+        )
+        for lead in direct_leads:
+            lead_id = str(lead.id)
+            leads_by_id[lead_id] = {
+                'id': lead_id,
+                'name': lead.name or '',
+                'lead_no': lead.lead_no or '',
+                'phone': lead.phone or '',
+                'company_name': lead.company_name or '',
+                'location': lead.location or '',
+                'project_name': lead.project_name or '',
+                'link_type': 'linked',
+            }
+
+        for item in MongoAPI.project_match_leads(org_id, project_id, current_user):
+            lead_id = item.get('_id')
+            if not lead_id or lead_id in leads_by_id:
+                continue
+            try:
+                lead = Lead.objects.get(id=ObjectId(lead_id), org_id=int(org_id))
+            except (Lead.DoesNotExist, InvalidId):
+                continue
+            leads_by_id[lead_id] = {
+                'id': lead_id,
+                'name': lead.name or item.get('name') or '',
+                'lead_no': lead.lead_no or '',
+                'phone': lead.phone or item.get('phone') or '',
+                'company_name': lead.company_name or '',
+                'location': item.get('location') or lead.location or '',
+                'project_name': lead.project_name or '',
+                'link_type': 'matched',
+                'match_score': item.get('match_score'),
+                'match_reasons': item.get('match_reasons') or [],
+            }
+
+        return list(leads_by_id.values())[:limit]
+
+    @staticmethod
+    def search_projects_for_chat(org_id, search_text, current_user, limit=5):
+        text = (search_text or '').strip()
+        if not text:
+            return []
+
+        search_regex = MongoAPI._flexible_search_regex(text)
+        if not search_regex:
+            return []
+
+        projects = Project.objects(__raw__={
+            'org_id': int(org_id),
+            '$or': [
+                {'name': search_regex},
+                {'location': search_regex},
+                {'project_no': search_regex},
+                {'area_locality': search_regex},
+                {'dtcp_number': search_regex},
+                {'rera_number': search_regex},
+                {'price_per_cent': search_regex},
+            ],
+        }).only('id', 'name', 'project_no', 'location', 'status')[:limit]
+
+        return [
+            {
+                'id': str(project.id),
+                'name': project.name or '',
+                'project_no': project.project_no or '',
+                'location': project.location or '',
+                'status': project.status or '',
+            }
+            for project in projects
+        ]
+
+    @staticmethod
+    def search_bookings_for_chat(org_id, search_text, current_user, limit=5):
+        text = (search_text or '').strip()
+        if not text:
+            return []
+
+        match_filter = {'org_id': int(org_id), 'status': 'active'}
+        MongoAPI._apply_booking_visibility_filter(match_filter, org_id, current_user)
+        escaped = re.escape(text)
+        search_regex = {'$regex': escaped, '$options': 'i'}
+        match_filter['$or'] = [
+            {'customer_name': search_regex},
+            {'receipt_number': search_regex},
+            {'project_name': search_regex},
+            {'unit_no': search_regex},
+        ]
+
+        bookings = Booking.objects(__raw__=match_filter).only(
+            'id', 'customer_name', 'receipt_number', 'project_name', 'unit_no', 'amount_paid',
+        )[:limit]
+        return [
+            {
+                'id': str(booking.id),
+                'customer_name': booking.customer_name or '',
+                'receipt_number': booking.receipt_number or '',
+                'project_name': booking.project_name or '',
+                'unit_no': booking.unit_no or '',
+                'amount_paid': booking.amount_paid or 0,
+            }
+            for booking in bookings
+        ]
+
+    @staticmethod
+    def get_crm_chat_snapshot(org_id, current_user):
+        org_id = int(org_id)
+        today = datetime.datetime.now().strftime('%d/%m/%Y')
+        followups = MongoAPI.all_crm_tasks_calender(
+            org_id, current_user, today, today, None, 'Open',
+        )
+        followups = (Uid.fix_array(followups) or [])[:5]
+
+        projects, _ = MongoAPI.project_list(
+            org_id, current_user, 5, 1, {}, -1, 'create_date', '',
+        )
+        booking_data = MongoAPI.booking_list(
+            org_id, current_user, 5, 1, {}, -1, 'booking_date', '', None, None, None,
+        )
+        bookings = (booking_data or {}).get('rows') or []
+
+        return {
+            'lead_metrics': MongoAPI.lead_metrics(org_id, current_user),
+            'project_metrics': MongoAPI.project_metrics(org_id, current_user),
+            'booking_metrics': MongoAPI.booking_metrics(org_id, current_user),
+            'recent_projects': [
+                {
+                    'name': item.get('name', ''),
+                    'project_no': item.get('project_no', ''),
+                    'location': item.get('location', ''),
+                    'available_units': item.get('available_units', 0),
+                    'total_units': item.get('total_units', 0),
+                }
+                for item in (projects or [])[:5]
+            ],
+            'recent_bookings': [
+                {
+                    'customer_name': item.get('customer_name', ''),
+                    'receipt_number': item.get('receipt_number', ''),
+                    'project_name': item.get('project_name', ''),
+                    'unit_no': item.get('unit_no', ''),
+                    'amount_paid': item.get('amount_paid', 0),
+                }
+                for item in bookings[:5]
+            ],
+            'followups_today': [
+                {
+                    'description': item.get('description') or item.get('task_name', ''),
+                    'date': item.get('date', ''),
+                    'associate_to': item.get('associate_to', ''),
+                }
+                for item in followups
+            ],
+        }
+
+    @staticmethod
     def _format_lead_list_item(item, org_id, current_user):
         settings = defaultdict(list)
         for field_name, field_value in item.items():
@@ -3905,6 +4255,11 @@ class MongoAPI:
                 if teams:
                     settings['teams'] = teams
 
+            if 'suggested_projects' in data1:
+                settings['suggested_projects'] = MongoAPI._extract_object_id_list(
+                    data1.get('suggested_projects', []),
+                )
+
             if 'customer_requirement' in data1:
                 customer_requirements = MongoAPI._extract_object_id_list(
                     data1['customer_requirement'],
@@ -3917,7 +4272,7 @@ class MongoAPI:
             for field, value in data1.items():
                 if field in skip_fields or field not in allowed_fields:
                     continue
-                if field in ('teams', 'customer_requirement'):
+                if field in ('teams', 'customer_requirement', 'suggested_projects'):
                     continue
                 if field in object_id_fields:
                     object_id = MongoAPI._extract_object_id(value)
@@ -3936,6 +4291,27 @@ class MongoAPI:
             Lead.objects(org_id=org_id, id=ObjectId(id)).update_one(**settings)
             return str(id)
         except (NotUniqueError, InvalidId, ValidationError):
+            return '0'
+
+    @staticmethod
+    def get_lead_suggested_projects(org_id, lead_id):
+        try:
+            lead = Lead.objects.get(org_id=int(org_id), id=ObjectId(lead_id))
+            projects = getattr(lead, 'suggested_projects', None) or []
+            return [str(project_id) for project_id in projects]
+        except (Lead.DoesNotExist, InvalidId, TypeError, ValueError):
+            return []
+
+    @staticmethod
+    def update_lead_suggested_projects(org_id, lead_id, project_ids):
+        try:
+            object_ids = MongoAPI._extract_object_id_list(project_ids)
+            Lead.objects(org_id=int(org_id), id=ObjectId(lead_id)).update(
+                set__suggested_projects=object_ids,
+                set__modify_date=datetime.datetime.now(timezone("UTC")),
+            )
+            return str(lead_id)
+        except (NotUniqueError, InvalidId, ValidationError, TypeError, ValueError):
             return '0'
 
 
@@ -4138,6 +4514,10 @@ class MongoAPI:
                         teams = item[item1]
                         teams= [str(data) for data in teams]
                         settings['teams']=teams
+
+                    if item1=='suggested_projects':
+                        suggested_projects = item[item1]
+                        settings['suggested_projects'] = [str(data) for data in suggested_projects]
 
                     #v1 modified start
                     if item1=='createBy':

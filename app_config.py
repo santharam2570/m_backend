@@ -268,6 +268,7 @@ lead_project = {
     'customer_requirement_name': 1,
     'payment_terms_name': 1,
     'teams': 1,
+    'suggested_projects': 1,
     'createBy': 1,
     'lead_no': 1,
     'project_name': 1,

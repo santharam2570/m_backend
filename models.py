@@ -176,6 +176,7 @@ class Lead(db.Document):
     industry = db.ObjectIdField(required=False)
     application = db.ObjectIdField(required=False)
     teams = db.ListField(db.ObjectIdField())
+    suggested_projects = db.ListField(db.ObjectIdField())
     status = db.StringField(required=True, default='active')
     target_date = db.DateTimeField(required=False)
     converted_date = db.DateTimeField(required=False)
