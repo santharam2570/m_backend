@@ -113,6 +113,18 @@ order_dict = {'asc': 1, 'desc': -1}
 UPLOAD_OPEN_EMAIL_FOLDER = 'uploads/email/'
 UPLOAD_OPEN_DOCUMENT_FOLDER = 'uploads/document/'
 UPLOAD_PDF_IMAGE_FOLDER = 'uploads/pdf_image/'
+UPLOAD_PROFILE_FOLDER = 'uploads/profile/'
+UPLOAD_USER_DOCUMENT_FOLDER = 'uploads/user-documents/'
+
+PROFILE_ALLOWED_EXTENSIONS = {'jpg', 'jpeg', 'png', 'webp'}
+PROFILE_ALLOWED_MIME_TYPES = {'image/jpeg', 'image/png', 'image/webp'}
+PROFILE_MAX_SIZE_BYTES = 512 * 1024
+
+USER_DOCUMENT_ALLOWED_EXTENSIONS = {'jpg', 'jpeg', 'png', 'webp', 'pdf'}
+USER_DOCUMENT_ALLOWED_MIME_TYPES = {
+    'image/jpeg', 'image/png', 'image/webp', 'application/pdf',
+}
+USER_DOCUMENT_MAX_SIZE_BYTES = 5 * 1024 * 1024
 
 ALLOWED_EXTENSIONS = {
     'pdf', 'png', 'jpg', 'jpeg', 'gif', 'doc', 'docx',

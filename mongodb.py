@@ -20,14 +20,24 @@ from permissions_config import (
     DEFAULT_ROLE_PERMISSIONS,
     MODULE_KEYS,
     ORG_LEVEL_PERMISSIONS,
+    SYSTEM_ROLE_DEFAULTS,
+    SYSTEM_ROLE_NAMES,
+    VIEW_SCOPE_GROUPS,
+    apply_view_scope_exclusivity,
+    flatten_role_permission_payload,
 )
 from rbac import (
+    SUPER_ADMIN_IDENTITY_ERROR,
     can_manage_target_user,
     effective_tier,
     get_accessible_branch_ids,
+    is_super_admin_role_name,
+    is_super_admin_user,
+    normalize_tier,
     validate_permission_grant,
     validate_user_tier_branch,
 )
+from user_details_validator import normalize_user_detail_payload
 from models import (
     Admin_email,
     Branch,
@@ -65,6 +75,8 @@ from models import (
 
 
 class MongoAPI:
+    _USER_BRANCH_MIGRATED_ORGS = set()
+
     @staticmethod
     def _parse_date_value(value):
         if value is None or value == '' or str(value).lower() == 'none':
@@ -101,19 +113,37 @@ class MongoAPI:
     def _user_dict(user):
         create_date = MongoAPI._format_display_date(user.create_date)
         role_tier = getattr(user, 'role_tier', None) or None
-        branch_id = getattr(user, 'branch_id', None) or None
+        MongoAPI._ensure_user_branch_object_id(user)
+        branch_ref = getattr(user, 'branch_id', None)
+        branch_id = MongoAPI._serialize_user_branch_id(user.org_id, branch_ref)
         role_name = None
 
         if user.role:
             try:
                 role = Role.objects.get(id=user.role)
                 role_name = role.role_name
-                if role.role_name == 'Administrator':
+                if role.role_name in ('Super Admin', 'Administrator'):
                     role_tier = 'super_admin'
             except Role.DoesNotExist:
                 pass
         if not role_tier:
             role_tier = 'branch_user'
+
+        aadhaar_number = getattr(user, 'aadhaar_number', None) or None
+        aadhaar_document = getattr(user, 'aadhaar_document', None) or None
+        pan_number = getattr(user, 'pan_number', None) or None
+        pan_document = getattr(user, 'pan_document', None) or None
+        address = getattr(user, 'address', None) or None
+        source = getattr(user, 'source', None) or None
+        referred_by = getattr(user, 'referred_by', None) or None
+        reference_contact_number = (
+            getattr(user, 'reference_contact_number', None) or None
+        )
+        passport_number = getattr(user, 'passport_number', None) or None
+        assigned_project_ids, assigned_project_names = MongoAPI._resolve_assigned_projects(
+            user.org_id,
+            getattr(user, 'assigned_project_ids', None) or [],
+        )
 
         return {
             'id': str(user.id),
@@ -128,23 +158,59 @@ class MongoAPI:
             'status': user.status,
             'role_tier': role_tier,
             'branch_id': branch_id,
+            'profile_image': getattr(user, 'profile_image', '') or '',
+            'aadhaar_number': aadhaar_number,
+            'aadhaar_document': aadhaar_document,
+            'pan_number': pan_number,
+            'pan_document': pan_document,
+            'address': address,
+            'source': source,
+            'referred_by': referred_by,
+            'reference_contact_number': reference_contact_number,
+            'passport_number': passport_number,
+            'permission_overrides': dict(getattr(user, 'permission_overrides', None) or {}),
+            # Frontend alias keys
+            'aadhaar': aadhaar_number,
+            'aadhaar_doc': aadhaar_document,
+            'pan': pan_number,
+            'pan_doc': pan_document,
+            'referredBy': referred_by,
+            'reference_contact': reference_contact_number,
+            'reference_phone': reference_contact_number,
+            'assigned_project_ids': assigned_project_ids,
+            'assigned_project_names': assigned_project_names,
         }
 
     @staticmethod
     def selectLogin(email, password):
         try:
-            user = User.objects.get(email=email, password=password)
+            user = User.objects.get(
+                email=MongoAPI._normalize_email(email),
+                password=password,
+            )
             return MongoAPI._user_dict(user)
         except User.DoesNotExist:
             return 'no such name'
 
     @staticmethod
+    def _normalize_email(email):
+        return str(email or '').strip().lower()
+
+    @staticmethod
     def get_user_by_email(email):
         try:
-            user = User.objects.get(email=str(email))
+            user = User.objects.get(email=MongoAPI._normalize_email(email))
             return MongoAPI._user_dict(user)
         except User.DoesNotExist:
             return 'no such name'
+
+    @staticmethod
+    def get_user_password_hash(user_id):
+        try:
+            user = User.objects.only('password').get(id=ObjectId(user_id))
+            return user.password or ''
+        except (User.DoesNotExist, InvalidId):
+            return ''
 
     @staticmethod
     def emailCheck(email):
@@ -153,7 +219,7 @@ class MongoAPI:
     @staticmethod
     def userCheck(email):
         try:
-            User.objects.get(email=email)
+            User.objects.get(email=MongoAPI._normalize_email(email))
             return 'Yes'
         except User.DoesNotExist:
             return 'No'
@@ -161,6 +227,12 @@ class MongoAPI:
     @staticmethod
     def userRoleUpdate(user_id, role_id):
         try:
+            user = User.objects.get(id=ObjectId(user_id))
+            target = MongoAPI._user_dict(user)
+            if is_super_admin_user(target):
+                admin_role_id = MongoAPI.userAdministratorRole(target.get('org_id'))
+                if admin_role_id and str(role_id) != str(admin_role_id):
+                    return 'protected'
             User.objects(id=ObjectId(user_id)).update_one(role=ObjectId(role_id))
             return 'Yes'
         except Exception:
@@ -168,29 +240,49 @@ class MongoAPI:
 
     @staticmethod
     def userAdministratorRole(org_id):
-        try:
-            role = Role.objects.get(org_id=int(org_id), role_name='Administrator')
-            return str(role.id)
-        except Role.DoesNotExist:
-            return 0
+        for role_name in ('Super Admin', 'Administrator'):
+            try:
+                role = Role.objects.get(org_id=int(org_id), role_name=role_name)
+                if role_name == 'Administrator' and role.role_name != 'Super Admin':
+                    role.role_name = 'Super Admin'
+                    role.is_system_role = 1
+                    role.save()
+                return str(role.id)
+            except Role.DoesNotExist:
+                continue
+        return 0
 
     @staticmethod
     def roleSubmit(org_id, user_id, data):
         try:
+            role_name = data['role_name']
+            defaults = SYSTEM_ROLE_DEFAULTS.get(role_name, DEFAULT_ROLE_PERMISSIONS)
             role_data = {
                 'org_id': org_id,
-                'role_name': data['role_name'],
+                'role_name': role_name,
                 'create_by': ObjectId(user_id),
+                'is_system_role': 1 if role_name in SYSTEM_ROLE_NAMES else 0,
+                **defaults,
             }
-            if data['role_name'] == 'Administrator':
-                role_data.update(DEFAULT_ADMIN_PERMISSIONS)
-            else:
-                role_data.update(DEFAULT_ROLE_PERMISSIONS)
             role = Role(**role_data)
             role.save()
             return str(role.id)
         except NotUniqueError:
             return '0'
+
+    @staticmethod
+    def _role_is_system(role):
+        if int(getattr(role, 'is_system_role', 0) or 0) == 1:
+            return True
+        return role.role_name in SYSTEM_ROLE_NAMES
+
+    @staticmethod
+    def _role_permissions_from_role(role):
+        # Super Admin is always treated as having every permission, even if
+        # older role documents were seeded before new permission keys existed.
+        if is_super_admin_role_name(getattr(role, 'role_name', None)):
+            return {key: 1 for key in ALL_ROLE_KEYS}
+        return {key: int(getattr(role, key, 0) or 0) for key in ALL_ROLE_KEYS}
 
     @staticmethod
     def _role_to_dict(role):
@@ -200,13 +292,31 @@ class MongoAPI:
             '_id': str(role.id),
             'org_id': role.org_id,
             'role_name': role.role_name,
+            'is_system': MongoAPI._role_is_system(role),
         }
-        if role.role_name == 'Administrator':
-            data.update(DEFAULT_ADMIN_PERMISSIONS)
-            return data
-        for key in ALL_ROLE_KEYS:
-            data[key] = int(getattr(role, key, 0) or 0)
+        data.update(MongoAPI._role_permissions_from_role(role))
         return data
+
+    @staticmethod
+    def _role_to_detail(role):
+        return {
+            '_id': str(role.id),
+            'role_name': role.role_name,
+            'org_id': role.org_id,
+            'is_system': MongoAPI._role_is_system(role),
+            'permissions': MongoAPI._role_permissions_from_role(role),
+        }
+
+    @staticmethod
+    def _role_list_item(role, org_id):
+        return {
+            '_id': str(role.id),
+            'role_name': role.role_name,
+            'org_id': role.org_id,
+            'is_system': MongoAPI._role_is_system(role),
+            'user_count': MongoAPI.users_count_by_role(org_id, str(role.id)),
+            'permissions': MongoAPI._role_permissions_from_role(role),
+        }
 
     @staticmethod
     def getRolesListDetails(org_id, role_id):
@@ -217,16 +327,131 @@ class MongoAPI:
             return {}
 
     @staticmethod
+    def get_role_detail(org_id, role_id):
+        try:
+            role = Role.objects.get(org_id=int(org_id), id=ObjectId(role_id))
+            return MongoAPI._role_to_detail(role)
+        except (Role.DoesNotExist, InvalidId):
+            return {}
+
+    @staticmethod
     def get_user_role_data(org_id, user_id):
         user = MongoAPI.getUserDetails(org_id, user_id)
         role_id = user.get('role')
         if not role_id:
-            admin_role_id = MongoAPI.userAdministratorRole(org_id)
-            if admin_role_id and admin_role_id != 0:
-                role_id = admin_role_id
-            else:
-                return {}
-        return MongoAPI.getRolesListDetails(org_id, role_id)
+            return {}
+        role_data = MongoAPI.getRolesListDetails(org_id, role_id)
+        return MongoAPI._apply_user_permission_overrides(role_data, user)
+
+    @staticmethod
+    def _normalize_permission_overrides(raw_overrides):
+        if not isinstance(raw_overrides, dict):
+            return {}
+        normalized = {}
+        for key, value in raw_overrides.items():
+            if key not in ALL_ROLE_KEYS:
+                continue
+            try:
+                normalized[key] = 1 if int(value) == 1 else 0
+            except (TypeError, ValueError):
+                continue
+        return normalized
+
+    @staticmethod
+    def _apply_user_permission_overrides(role_data, user):
+        """Merge per-user permission overrides onto role permissions."""
+        if not role_data:
+            return role_data
+        if is_super_admin_user(user, role_data):
+            return role_data
+
+        overrides = MongoAPI._normalize_permission_overrides(
+            (user or {}).get('permission_overrides')
+        )
+        if not overrides:
+            return role_data
+
+        merged = dict(role_data)
+        merged.update(overrides)
+
+        # When a view-scope override is present, keep exclusivity against the
+        # effective permission set (role + overrides).
+        exclusive = apply_view_scope_exclusivity(
+            {key: merged.get(key, 0) for key in ALL_ROLE_KEYS}
+        )
+        for group in VIEW_SCOPE_GROUPS:
+            if any(member in overrides for member in group):
+                for key in group:
+                    merged[key] = 1 if int(exclusive.get(key, 0) or 0) == 1 else 0
+
+        return merged
+
+    @staticmethod
+    def get_user_effective_permissions(org_id, user_id):
+        role_data = MongoAPI.get_user_role_data(org_id, user_id)
+        if not role_data:
+            return {}
+        user = MongoAPI.getUserDetails(org_id, user_id)
+        permissions = {
+            key: int(role_data.get(key, 0) or 0) for key in ALL_ROLE_KEYS
+        }
+        return {
+            'role_id': user.get('role'),
+            'role_name': role_data.get('role_name'),
+            'permissions': permissions,
+            'overrides': MongoAPI._normalize_permission_overrides(
+                user.get('permission_overrides')
+            ),
+        }
+
+    @staticmethod
+    def update_user_permission(org_id, user_id, permission_key, value, actor=None):
+        if permission_key not in ALL_ROLE_KEYS:
+            return f'unknown_permission:{permission_key}'
+
+        try:
+            target = User.objects.get(id=ObjectId(user_id), org_id=int(org_id))
+        except (User.DoesNotExist, InvalidId):
+            return '0'
+
+        target_dict = MongoAPI._user_dict(target)
+        if actor and not can_manage_target_user(actor, target_dict):
+            return 'You cannot manage this user'
+
+        if is_super_admin_user(target_dict):
+            return SUPER_ADMIN_IDENTITY_ERROR
+
+        enabled = 1 if int(value) == 1 else 0
+        if actor:
+            actor_role_data = MongoAPI.get_user_role_data(
+                org_id,
+                str(actor.get('id') or actor.get('_id') or ''),
+            )
+            ok, error_msg = validate_permission_grant(
+                actor, actor_role_data, permission_key, enabled,
+            )
+            if not ok:
+                return error_msg
+
+        overrides = MongoAPI._normalize_permission_overrides(
+            getattr(target, 'permission_overrides', None) or {}
+        )
+        overrides[permission_key] = enabled
+
+        # Keep view-scope exclusivity inside stored overrides.
+        scoped = apply_view_scope_exclusivity({**overrides, permission_key: enabled})
+        for group in VIEW_SCOPE_GROUPS:
+            if permission_key in group:
+                for key in group:
+                    if int(scoped.get(key, 0) or 0) == 1:
+                        overrides[key] = 1
+                    elif key in overrides or key == permission_key:
+                        overrides[key] = 0
+
+        target.permission_overrides = overrides
+        target.modify_date = MongoAPI._utc_now()
+        target.save()
+        return str(target.id)
 
     @staticmethod
     def user_has_permission(org_id, user_id, permission_key):
@@ -238,7 +463,7 @@ class MongoAPI:
         role_data = MongoAPI.get_user_role_data(org_id, user_id)
         if not role_data:
             return False
-        if role_data.get('role_name') == 'Administrator':
+        if role_data.get('role_name') in ('Super Admin', 'Administrator'):
             return True
         return int(role_data.get(permission_key, 0) or 0) == 1
 
@@ -264,10 +489,27 @@ class MongoAPI:
         return plan_data
 
     @staticmethod
-    def users_list(org_id, search='', sort='create_date', order=-1, status=None, actor=None):
+    def users_list(
+        org_id,
+        search='',
+        sort='create_date',
+        order=-1,
+        status=None,
+        actor=None,
+        branch_id=None,
+        filter_data=None,
+    ):
         query = User.objects(org_id=int(org_id))
         if status in ('active', 'inactive'):
             query = query.filter(status=status)
+
+        branch_filter_ids = MongoAPI._resolve_user_branch_filter_ids(
+            org_id, actor, branch_id, filter_data,
+        )
+        if branch_filter_ids is not None:
+            if not branch_filter_ids:
+                return []
+            query = query.filter(branch_id__in=branch_filter_ids)
 
         users = list(query)
         if actor:
@@ -275,16 +517,22 @@ class MongoAPI:
             filtered = []
             for user in users:
                 target = MongoAPI._user_dict(user)
+                target_tier = effective_tier(target)
                 if actor_tier == 'super_admin':
                     filtered.append(user)
                 elif actor_tier == 'admin':
-                    if effective_tier(target) != 'super_admin':
+                    if target_tier != 'super_admin':
                         filtered.append(user)
-                elif actor_tier == 'branch_manager':
-                    if (
-                        target.get('branch_id') == actor.get('branch_id')
-                        and effective_tier(target) == 'branch_user'
-                    ):
+                else:
+                    # Branch managers / branch users with manage_users see
+                    # same-branch non-admin users only.
+                    if target_tier in ('super_admin', 'admin'):
+                        continue
+                    actor_branch = str(actor.get('branch_id') or '')
+                    target_branch = str(target.get('branch_id') or '')
+                    if actor_branch and target_branch and actor_branch == target_branch:
+                        filtered.append(user)
+                    elif str(target.get('id') or '') == str(actor.get('id') or ''):
                         filtered.append(user)
             users = filtered
 
@@ -307,19 +555,22 @@ class MongoAPI:
             return (value or '').lower() if isinstance(value, str) else (value or '')
 
         users.sort(key=sort_value, reverse=reverse)
-        return [MongoAPI._user_dict(user) for user in users]
+        user_dicts = [MongoAPI._user_dict(user) for user in users]
+        return MongoAPI._attach_branch_names(org_id, user_dicts)
 
     @staticmethod
-    def active_users_list(org_id):
-        users = User.objects(org_id=int(org_id), status='active').order_by('name')
+    def active_users_list(org_id, actor=None, branch_id=None):
+        query = User.objects(org_id=int(org_id), status='active')
+        branch_filter_ids = MongoAPI._resolve_user_branch_filter_ids(
+            org_id, actor, branch_id,
+        )
+        if branch_filter_ids is not None:
+            if not branch_filter_ids:
+                return []
+            query = query.filter(branch_id__in=branch_filter_ids)
         return [
-            {
-                '_id': str(user.id),
-                'id': str(user.id),
-                'name': user.name or '',
-                'email': user.email,
-            }
-            for user in users
+            MongoAPI._user_dict(user)
+            for user in query.order_by('name')
         ]
 
     @staticmethod
@@ -336,7 +587,7 @@ class MongoAPI:
         ok, error_msg = validate_user_tier_branch(
             actor_user,
             data,
-            lambda branch_id: MongoAPI.branch_exists(org_id, branch_id),
+            lambda branch_id: MongoAPI.user_branch_exists(org_id, branch_id),
             actor_role_data=actor_role_data,
         )
         if not ok:
@@ -345,9 +596,11 @@ class MongoAPI:
         name = (data.get('name') or '').strip()
         phone = str(data.get('phone') or '')
         role_id = data.get('role')
+        if not role_id:
+            return 'role_required'
         password = data.get('password') or ''
         role_tier = data.get('role_tier') or 'branch_user'
-        branch_id = MongoAPI._parse_branch_id(data.get('branch_id'))
+        branch_id = MongoAPI._parse_user_branch_id(data.get('branch_id'), org_id)
 
         try:
             user_data = {
@@ -358,21 +611,15 @@ class MongoAPI:
                 'status': 'active',
                 'create_date': datetime.datetime.now(timezone('UTC')),
                 'role_tier': role_tier,
+                'role': ObjectId(role_id),
             }
             if branch_id:
                 user_data['branch_id'] = branch_id
-            if role_id:
-                user_data['role'] = ObjectId(role_id)
             if password:
                 user_data['password'] = password
 
             user = User(**user_data)
             user.save()
-
-            if not role_id:
-                admin_role_id = MongoAPI.userAdministratorRole(org_id)
-                if admin_role_id and admin_role_id != 0:
-                    MongoAPI.userRoleUpdate(str(user.id), admin_role_id)
 
             return str(user.id)
         except (NotUniqueError, InvalidId):
@@ -392,7 +639,7 @@ class MongoAPI:
         ok, error_msg = validate_user_tier_branch(
             actor_user,
             data,
-            lambda branch_id: MongoAPI.branch_exists(org_id, branch_id),
+            lambda branch_id: MongoAPI.user_branch_exists(org_id, branch_id),
             existing_target=existing_target,
             actor_role_data=actor_role_data,
         )
@@ -416,10 +663,54 @@ class MongoAPI:
         if 'role_tier' in data:
             user.role_tier = data.get('role_tier') or 'branch_user'
         if 'branch_id' in data:
-            user.branch_id = MongoAPI._parse_branch_id(data.get('branch_id'))
+            user.branch_id = MongoAPI._parse_user_branch_id(data.get('branch_id'), org_id)
+        if 'assigned_project_ids' in data:
+            user.assigned_project_ids = MongoAPI._extract_object_id_list(
+                data.get('assigned_project_ids'),
+            )
 
+        detail_fields = normalize_user_detail_payload(data)
+        if detail_fields:
+            uniqueness_error = MongoAPI._apply_user_detail_fields(
+                user, detail_fields, org_id, user_id,
+            )
+            if uniqueness_error:
+                return uniqueness_error
+
+        user.modify_date = datetime.datetime.now(timezone('UTC'))
         user.save()
         return str(user.id)
+
+    @staticmethod
+    def _apply_user_detail_fields(user, detail_fields, org_id, user_id):
+        if 'aadhaar_number' in detail_fields:
+            aadhaar_number = detail_fields.get('aadhaar_number')
+            if aadhaar_number:
+                existing = User.objects(
+                    org_id=int(org_id), aadhaar_number=aadhaar_number,
+                ).first()
+                if existing and str(existing.id) != str(user_id):
+                    return 'aadhaar_exists'
+            user.aadhaar_number = aadhaar_number
+
+        if 'pan_number' in detail_fields:
+            pan_number = detail_fields.get('pan_number')
+            if pan_number:
+                existing = User.objects(
+                    org_id=int(org_id), pan_number=pan_number,
+                ).first()
+                if existing and str(existing.id) != str(user_id):
+                    return 'pan_exists'
+            user.pan_number = pan_number
+
+        for field in (
+            'aadhaar_document', 'pan_document', 'address', 'source',
+            'referred_by', 'reference_contact_number', 'passport_number',
+        ):
+            if field in detail_fields:
+                setattr(user, field, detail_fields.get(field))
+
+        return None
 
     @staticmethod
     def user_change_status(org_id, user_id, status, actor=None):
@@ -442,25 +733,80 @@ class MongoAPI:
             return '0'
 
     @staticmethod
-    def roles_list(org_id):
-        roles = Role.objects(org_id=int(org_id)).order_by('role_name')
-        return [MongoAPI._role_to_dict(role) for role in roles]
+    def _migrate_removed_branch_manager_tier(org_id):
+        User.objects(org_id=int(org_id), role_tier='branch_manager').update(
+            set__role_tier='branch_user',
+        )
 
     @staticmethod
-    def role_create(org_id, user_id, role_name):
+    def _cleanup_legacy_system_roles(org_id, super_admin_role):
+        """Remove old seeded default roles only; keep user-created custom roles."""
+        if not super_admin_role:
+            return
+        for legacy_name in ('Manager', 'Standard User', 'Administrator'):
+            legacy = Role.objects(org_id=int(org_id), role_name=legacy_name).first()
+            if not legacy:
+                continue
+            if int(getattr(legacy, 'is_system_role', 0) or 0) != 1:
+                continue
+            User.objects(org_id=int(org_id), role=legacy.id).update(
+                set__role=super_admin_role.id,
+            )
+            legacy.delete()
+
+    @staticmethod
+    def roles_list(org_id):
+        MongoAPI._migrate_removed_branch_manager_tier(org_id)
+        super_admin = Role.objects(org_id=int(org_id), role_name='Super Admin').first()
+        if not super_admin:
+            old_admin = Role.objects(org_id=int(org_id), role_name='Administrator').first()
+            if old_admin:
+                old_admin.role_name = 'Super Admin'
+                old_admin.is_system_role = 1
+                old_admin.save()
+                super_admin = old_admin
+
+        roles = Role.objects(org_id=int(org_id)).order_by('role_name')
+        return [MongoAPI._role_list_item(role, org_id) for role in roles]
+
+    @staticmethod
+    def role_create(org_id, user_id, role_name, permissions=None, actor_user_id=None):
         role_name = (role_name or '').strip()
         if not role_name:
             return 'missing_name'
         if Role.objects(org_id=int(org_id), role_name=role_name).first():
             return 'duplicate'
 
+        permission_updates = apply_view_scope_exclusivity(
+            flatten_role_permission_payload(permissions or {}),
+        )
+        for key in permission_updates:
+            if key not in ALL_ROLE_KEYS:
+                return f'unknown_permission:{key}'
+
+        actor = None
+        actor_role_data = None
+        if actor_user_id:
+            actor = MongoAPI.getUserDetails(org_id, actor_user_id)
+            actor_role_data = MongoAPI.get_user_role_data(org_id, actor_user_id)
+
         try:
             role_data = {
                 'org_id': int(org_id),
                 'role_name': role_name,
                 'create_by': ObjectId(user_id),
+                'is_system_role': 0,
                 **DEFAULT_ROLE_PERMISSIONS,
             }
+            for key, value in permission_updates.items():
+                if actor_user_id:
+                    ok, error_msg = validate_permission_grant(
+                        actor, actor_role_data, key, value,
+                    )
+                    if not ok:
+                        return error_msg
+                role_data[key] = 1 if int(value) == 1 else 0
+
             role = Role(**role_data)
             role.save()
             return str(role.id)
@@ -474,50 +820,113 @@ class MongoAPI:
         except (Role.DoesNotExist, InvalidId):
             return '0'
 
-        if 'role_name' in data and data['role_name']:
-            new_name = data['role_name'].strip()
-            existing = Role.objects(org_id=int(org_id), role_name=new_name).first()
-            if existing and str(existing.id) != str(role_id):
-                return 'duplicate'
-            role.role_name = new_name
-
         actor = None
         actor_role_data = None
         if actor_user_id:
             actor = MongoAPI.getUserDetails(org_id, actor_user_id)
             actor_role_data = MongoAPI.get_user_role_data(org_id, actor_user_id)
 
-        for key, value in data.items():
-            if key in ('role_name', '_id', 'id', 'org_id', 'create_by', 'create_date'):
-                continue
-            if key in ALL_ROLE_KEYS:
-                if actor_user_id:
-                    ok, error_msg = validate_permission_grant(
-                        actor, actor_role_data, key, value,
-                    )
-                    if not ok:
-                        return error_msg
-                role[key] = 1 if int(value) == 1 else 0
+        is_system = MongoAPI._role_is_system(role)
+        if is_system and actor_user_id and effective_tier(actor) != 'super_admin':
+            return 'protected_system_role'
+
+        if 'role_name' in data:
+            if is_system or role.role_name in SYSTEM_ROLE_NAMES:
+                new_name = (data.get('role_name') or '').strip()
+                if new_name != role.role_name:
+                    return 'protected_super_admin_role_name'
+            elif data.get('role_name'):
+                new_name = data['role_name'].strip()
+                existing = Role.objects(org_id=int(org_id), role_name=new_name).first()
+                if existing and str(existing.id) != str(role_id):
+                    return 'duplicate'
+                role.role_name = new_name
+
+        permission_updates = apply_view_scope_exclusivity(flatten_role_permission_payload(data))
+        for key in permission_updates:
+            if key not in ALL_ROLE_KEYS:
+                return f'unknown_permission:{key}'
+
+        for key, value in permission_updates.items():
+            if actor_user_id:
+                ok, error_msg = validate_permission_grant(
+                    actor, actor_role_data, key, value,
+                )
+                if not ok:
+                    return error_msg
+            role[key] = 1 if int(value) == 1 else 0
 
         role.save()
         return str(role.id)
 
     @staticmethod
-    def role_delete(org_id, role_id):
+    def role_delete(org_id, role_id, reassign_to=None):
         try:
             role = Role.objects.get(org_id=int(org_id), id=ObjectId(role_id))
         except (Role.DoesNotExist, InvalidId):
             return '0'
 
-        if role.role_name == 'Administrator':
+        if MongoAPI._role_is_system(role):
             return 'protected'
 
         users_with_role = User.objects(org_id=int(org_id), role=ObjectId(role_id)).count()
         if users_with_role > 0:
-            return 'in_use'
+            if not reassign_to:
+                return 'in_use'
+            try:
+                target_role = Role.objects.get(org_id=int(org_id), id=ObjectId(reassign_to))
+            except (Role.DoesNotExist, InvalidId):
+                return 'invalid_reassign'
+            if str(target_role.id) == str(role_id):
+                return 'invalid_reassign'
+            User.objects(org_id=int(org_id), role=ObjectId(role_id)).update(
+                set__role=ObjectId(reassign_to),
+            )
 
         role.delete()
         return str(role_id)
+
+    @staticmethod
+    def seed_default_roles(org_id, user_id):
+        created = {}
+
+        # Rename old Administrator role to Super Admin if present
+        old_admin = Role.objects(org_id=int(org_id), role_name='Administrator').first()
+        if old_admin:
+            old_admin.role_name = 'Super Admin'
+            old_admin.is_system_role = 1
+            for key, value in DEFAULT_ADMIN_PERMISSIONS.items():
+                setattr(old_admin, key, value)
+            old_admin.save()
+
+        for role_name, defaults in SYSTEM_ROLE_DEFAULTS.items():
+            existing = Role.objects(org_id=int(org_id), role_name=role_name).first()
+            if existing:
+                if int(getattr(existing, 'is_system_role', 0) or 0) != 1:
+                    existing.is_system_role = 1
+                # Keep Super Admin in sync with the full permission catalog.
+                for key, value in defaults.items():
+                    setattr(existing, key, value)
+                existing.save()
+                created[role_name] = str(existing.id)
+                continue
+            role_data = {
+                'org_id': int(org_id),
+                'role_name': role_name,
+                'create_by': ObjectId(user_id),
+                'is_system_role': 1,
+                **defaults,
+            }
+            role = Role(**role_data)
+            role.save()
+            created[role_name] = str(role.id)
+
+        # Remove legacy seeded default roles (reassign users to Super Admin)
+        super_admin = Role.objects(org_id=int(org_id), role_name='Super Admin').first()
+        MongoAPI._cleanup_legacy_system_roles(org_id, super_admin)
+
+        MongoAPI._migrate_removed_branch_manager_tier(org_id)
+        return created
 
     @staticmethod
     def users_count_by_role(org_id, role_id):
@@ -531,6 +940,258 @@ class MongoAPI:
             return int(branch_id)
         except (TypeError, ValueError):
             return None
+
+    @staticmethod
+    def _parse_branch_id_list(branch_values):
+        if branch_values is None:
+            return []
+        if isinstance(branch_values, str):
+            if not branch_values.strip():
+                return []
+            parts = branch_values.split(',') if ',' in branch_values else [branch_values]
+        elif isinstance(branch_values, (list, tuple)):
+            parts = branch_values
+        else:
+            parts = [branch_values]
+
+        branch_ids = []
+        for part in parts:
+            parsed = MongoAPI._parse_branch_id(part)
+            if parsed is not None:
+                branch_ids.append(parsed)
+        return branch_ids
+
+    @staticmethod
+    def _branch_ids_from_filter_data(filter_data):
+        branch_ids = []
+        for data in filter_data or []:
+            field = data.get('field')
+            if field not in ('branch_id', 'branch'):
+                continue
+            branch_ids.extend(
+                MongoAPI._parse_branch_id_list(data.get('selected_values') or []),
+            )
+        return branch_ids
+
+    @staticmethod
+    def _parse_user_branch_id(branch_id, org_id=None):
+        if branch_id is None or branch_id == '':
+            return None
+        object_id = MongoAPI._extract_object_id(branch_id)
+        if object_id is not None:
+            return object_id
+        parsed_int = MongoAPI._parse_branch_id(branch_id)
+        if parsed_int is not None and org_id is not None:
+            return MongoAPI._branch_int_to_object_id(org_id, parsed_int)
+        return None
+
+    @staticmethod
+    def _parse_user_branch_id_list(branch_values, org_id=None):
+        if branch_values is None:
+            return []
+        if isinstance(branch_values, str):
+            if not branch_values.strip():
+                return []
+            parts = branch_values.split(',') if ',' in branch_values else [branch_values]
+        elif isinstance(branch_values, (list, tuple)):
+            parts = branch_values
+        else:
+            parts = [branch_values]
+
+        branch_ids = []
+        for part in parts:
+            parsed = MongoAPI._parse_user_branch_id(part, org_id)
+            if parsed is not None:
+                branch_ids.append(parsed)
+        return branch_ids
+
+    @staticmethod
+    def _user_branch_ids_from_filter_data(filter_data, org_id=None):
+        branch_ids = []
+        for data in filter_data or []:
+            field = data.get('field')
+            if field not in ('branch_id', 'branch'):
+                continue
+            branch_ids.extend(
+                MongoAPI._parse_user_branch_id_list(
+                    data.get('selected_values') or [], org_id,
+                ),
+            )
+        return branch_ids
+
+    @staticmethod
+    def _branch_int_to_object_id(org_id, branch_int):
+        if branch_int is None:
+            return None
+        try:
+            branch = Branch.objects.get(org_id=int(org_id), branch_id=int(branch_int))
+            return branch.id
+        except Branch.DoesNotExist:
+            return None
+
+    @staticmethod
+    def _branch_object_id_to_int(org_id, branch_ref):
+        object_id = MongoAPI._parse_user_branch_id(branch_ref, org_id)
+        if object_id is None:
+            return None
+        try:
+            branch = Branch.objects.get(org_id=int(org_id), id=object_id)
+            return branch.branch_id
+        except Branch.DoesNotExist:
+            return None
+
+    @staticmethod
+    def branch_ref_to_int(org_id, branch_ref):
+        if branch_ref is None or branch_ref == '':
+            return None
+        parsed_int = MongoAPI._parse_branch_id(branch_ref)
+        if parsed_int is not None:
+            return parsed_int
+        return MongoAPI._branch_object_id_to_int(org_id, branch_ref)
+
+    @staticmethod
+    def _branch_object_ids_to_ints(org_id, branch_refs):
+        branch_ints = []
+        for branch_ref in branch_refs or []:
+            parsed_int = MongoAPI.branch_ref_to_int(org_id, branch_ref)
+            if parsed_int is not None:
+                branch_ints.append(parsed_int)
+        return branch_ints
+
+    @staticmethod
+    def _resolve_user_branch_filter_ids(org_id, actor=None, branch_id=None, filter_data=None):
+        """Resolve Branch ObjectIds for user queries."""
+        explicit = MongoAPI._parse_user_branch_id_list(branch_id, org_id)
+        if not explicit:
+            explicit = MongoAPI._user_branch_ids_from_filter_data(filter_data, org_id)
+        if explicit:
+            if actor:
+                accessible = MongoAPI.get_actor_accessible_branch_ids(actor, org_id)
+                if accessible != 'all':
+                    accessible_set = {str(item) for item in accessible}
+                    explicit = [
+                        item for item in explicit if str(item) in accessible_set
+                    ]
+            return explicit
+
+        if actor:
+            accessible = MongoAPI.get_actor_accessible_branch_ids(actor, org_id)
+            if accessible != 'all':
+                return [
+                    parsed
+                    for item in accessible
+                    if (parsed := MongoAPI._parse_user_branch_id(item, org_id))
+                ] or []
+        return None
+
+    @staticmethod
+    def _resolve_branch_filter_ids(org_id, actor=None, branch_id=None, filter_data=None):
+        """Resolve integer branch IDs for lead/project/booking queries."""
+        explicit = MongoAPI._parse_branch_id_list(branch_id)
+        if not explicit:
+            explicit = MongoAPI._branch_ids_from_filter_data(filter_data)
+        if not explicit:
+            explicit = MongoAPI._branch_object_ids_to_ints(
+                org_id,
+                MongoAPI._parse_user_branch_id_list(branch_id, org_id),
+            )
+        if not explicit:
+            explicit = MongoAPI._branch_object_ids_to_ints(
+                org_id,
+                MongoAPI._user_branch_ids_from_filter_data(filter_data, org_id),
+            )
+        if explicit:
+            if actor:
+                accessible = MongoAPI.get_actor_accessible_branch_ids(actor, org_id)
+                if accessible != 'all':
+                    accessible_ints = MongoAPI._branch_object_ids_to_ints(org_id, accessible)
+                    explicit = [bid for bid in explicit if bid in accessible_ints]
+            return explicit
+
+        if actor:
+            accessible = MongoAPI.get_actor_accessible_branch_ids(actor, org_id)
+            if accessible != 'all':
+                return MongoAPI._branch_object_ids_to_ints(org_id, accessible)
+        return None
+
+    @staticmethod
+    def _apply_integer_list_filter(
+        match_filter, filter_key, selected_values, indicator, org_id=None,
+    ):
+        values = MongoAPI._parse_branch_id_list(selected_values)
+        if not values and org_id is not None:
+            values = MongoAPI._branch_object_ids_to_ints(
+                org_id,
+                MongoAPI._parse_user_branch_id_list(selected_values, org_id),
+            )
+        if not values:
+            return
+        if indicator == 'is':
+            match_filter[filter_key] = {'$in': values}
+        else:
+            match_filter[filter_key] = {'$nin': values}
+
+    @staticmethod
+    def _apply_branch_scope_to_match_filter(
+        match_filter, actor, filter_data=None, branch_id=None, org_id=None,
+        include_unset_branch=False,
+    ):
+        """Apply dynamic branch scope. Returns False when the result set must be empty."""
+        branch_filter_ids = MongoAPI._resolve_branch_filter_ids(
+            org_id, actor, branch_id, filter_data,
+        )
+        if branch_filter_ids is None:
+            return True
+        if not branch_filter_ids:
+            return False
+        branch_values = list(branch_filter_ids)
+        if include_unset_branch:
+            branch_values.append(None)
+        match_filter['branch_id'] = {'$in': branch_values}
+        return True
+
+    @staticmethod
+    def _resolve_lead_branch_id(org_id, data, actor_id=None):
+        explicit_branch = data.get('branch_id')
+        if explicit_branch not in (None, ''):
+            resolved = MongoAPI.branch_ref_to_int(org_id, explicit_branch)
+            if resolved is not None:
+                return resolved
+
+        for user_ref in (data.get('assigned_to'), actor_id):
+            user_id = MongoAPI._extract_object_id(user_ref)
+            if not user_id:
+                continue
+            user = MongoAPI.getUserDetails(org_id, user_id)
+            if not user:
+                continue
+            branch_int = MongoAPI.branch_ref_to_int(org_id, user.get('branch_id'))
+            if branch_int is not None:
+                return branch_int
+        return None
+
+    @staticmethod
+    def _attach_branch_names(org_id, user_dicts):
+        branch_object_ids = []
+        for item in user_dicts:
+            branch_id = item.get('branch_id')
+            if branch_id is None:
+                continue
+            object_id = MongoAPI._parse_user_branch_id(branch_id, org_id)
+            if object_id is not None:
+                branch_object_ids.append(object_id)
+        if not branch_object_ids:
+            return user_dicts
+
+        name_by_id = {
+            str(branch.id): branch.name
+            for branch in Branch.objects(org_id=int(org_id), id__in=branch_object_ids)
+        }
+        for item in user_dicts:
+            branch_id = item.get('branch_id')
+            if branch_id is not None:
+                item['branch_name'] = name_by_id.get(str(branch_id), '')
+        return user_dicts
 
     @staticmethod
     def _next_branch_id(org_id):
@@ -565,7 +1226,7 @@ class MongoAPI:
                 mapping[old_id] = next_id
                 next_id += 1
 
-        ref_models = (User, Lead, Project, Booking)
+        ref_models = (Lead, Project, Booking)
         for old_id, new_id in mapping.items():
             if old_id == new_id:
                 continue
@@ -580,9 +1241,83 @@ class MongoAPI:
                 )
 
     @staticmethod
+    def _serialize_user_branch_id(org_id, branch_ref):
+        """Return Branch document ObjectId as string for API responses."""
+        object_id = MongoAPI._parse_user_branch_id(branch_ref, org_id)
+        return str(object_id) if object_id else None
+
+    @staticmethod
+    def _ensure_user_branch_object_id(user):
+        """Migrate legacy integer branch_id to Branch ObjectId on read.
+
+        Does not clear unknown values — that belongs in bulk migration only.
+        """
+        branch_ref = getattr(user, 'branch_id', None)
+        if branch_ref is None:
+            return
+        if isinstance(branch_ref, ObjectId):
+            return
+
+        org_id = int(user.org_id)
+        branch = None
+        if isinstance(branch_ref, int):
+            branch = Branch.objects(org_id=org_id, branch_id=branch_ref).first()
+        elif isinstance(branch_ref, str) and branch_ref.strip().isdigit():
+            branch = Branch.objects(org_id=org_id, branch_id=int(branch_ref.strip())).first()
+        else:
+            object_id = MongoAPI._extract_object_id(branch_ref)
+            if object_id is not None:
+                branch = Branch.objects(org_id=org_id, id=object_id).first()
+
+        if branch and user.branch_id != branch.id:
+            user.branch_id = branch.id
+            user.save()
+
+    @staticmethod
+    def _migrate_user_branch_ids_to_object_id(org_id):
+        org_id = int(org_id)
+        if org_id in MongoAPI._USER_BRANCH_MIGRATED_ORGS:
+            return
+
+        MongoAPI._migrate_branch_ids_to_int(org_id)
+        coll = User._get_collection()
+        needs_migration = coll.count_documents({
+            'org_id': org_id,
+            'branch_id': {'$exists': True, '$ne': None, '$not': {'$type': 'objectId'}},
+        })
+        if needs_migration == 0:
+            MongoAPI._USER_BRANCH_MIGRATED_ORGS.add(org_id)
+            return
+
+        for user in coll.find({'org_id': org_id, 'branch_id': {'$exists': True, '$ne': None}}):
+            branch_ref = user.get('branch_id')
+            if isinstance(branch_ref, ObjectId):
+                continue
+            branch = None
+            if isinstance(branch_ref, int):
+                branch = Branch.objects(org_id=org_id, branch_id=branch_ref).first()
+            elif isinstance(branch_ref, str) and branch_ref.strip().isdigit():
+                branch = Branch.objects(org_id=org_id, branch_id=int(branch_ref.strip())).first()
+            else:
+                object_id = MongoAPI._extract_object_id(branch_ref)
+                if object_id is not None:
+                    branch = Branch.objects(org_id=org_id, id=object_id).first()
+            if branch:
+                coll.update_one(
+                    {'_id': user['_id']},
+                    {'$set': {'branch_id': branch.id}},
+                )
+            elif branch_ref is not None:
+                coll.update_one(
+                    {'_id': user['_id']},
+                    {'$unset': {'branch_id': ''}},
+                )
+        MongoAPI._USER_BRANCH_MIGRATED_ORGS.add(org_id)
+
+    @staticmethod
     def _branch_dict(branch):
         return {
-            'id': branch.branch_id,
+            'id': str(branch.id),
             'branch_id': branch.branch_id,
             'org_id': branch.org_id,
             'name': branch.name,
@@ -592,15 +1327,86 @@ class MongoAPI:
         }
 
     @staticmethod
+    def _org_assigned_branch_object_id_strings(org_id):
+        """Branches that have at least one user or project assigned in the org."""
+        org_id = int(org_id)
+        object_ids = set()
+
+        for user in User.objects(
+            org_id=org_id,
+            branch_id__exists=True,
+            branch_id__ne=None,
+        ).only('branch_id'):
+            if user.branch_id:
+                object_ids.add(user.branch_id)
+
+        for project in Project.objects(
+            org_id=org_id,
+            branch_id__exists=True,
+            branch_id__ne=None,
+        ).only('branch_id'):
+            branch_oid = MongoAPI._branch_int_to_object_id(org_id, project.branch_id)
+            if branch_oid is not None:
+                object_ids.add(branch_oid)
+
+        return [str(branch_oid) for branch_oid in object_ids]
+
+    @staticmethod
+    def get_actor_accessible_branch_ids(actor, org_id=None):
+        """Resolve accessible branch ids for list/query scoping."""
+        if not actor:
+            return 'all'
+
+        resolved_org_id = org_id or actor.get('org_id')
+        branch_id = actor.get('branch_id')
+        if branch_id not in (None, ''):
+            serialized = MongoAPI._serialize_user_branch_id(resolved_org_id, branch_id)
+            return [serialized] if serialized else []
+
+        # Org-level tiers see all branches; do not narrow to "in-use" branches.
+        return get_accessible_branch_ids(actor)
+
+    @staticmethod
     def branch_exists(org_id, branch_id):
         parsed = MongoAPI._parse_branch_id(branch_id)
-        if not parsed:
+        if parsed:
+            return Branch.objects(
+                org_id=int(org_id),
+                branch_id=parsed,
+                status='active',
+            ).first() is not None
+        object_id = MongoAPI._parse_user_branch_id(branch_id, org_id)
+        if object_id is None:
             return False
         return Branch.objects(
             org_id=int(org_id),
-            branch_id=parsed,
+            id=object_id,
             status='active',
         ).first() is not None
+
+    @staticmethod
+    def user_branch_exists(org_id, branch_id):
+        object_id = MongoAPI._parse_user_branch_id(branch_id, org_id)
+        if object_id is None:
+            return False
+        return Branch.objects(
+            org_id=int(org_id),
+            id=object_id,
+            status='active',
+        ).first() is not None
+
+    @staticmethod
+    def branch_allowed_for_record(user, org_id, record_branch_id):
+        parsed = MongoAPI._parse_branch_id(record_branch_id)
+        if not parsed:
+            return False
+        accessible = MongoAPI.get_actor_accessible_branch_ids(user, org_id)
+        if accessible == 'all':
+            return True
+        branch_oid = MongoAPI._branch_int_to_object_id(org_id, parsed)
+        if branch_oid is None:
+            return False
+        return any(str(item) == str(branch_oid) for item in accessible)
 
     @staticmethod
     def seed_default_branches(org_id):
@@ -629,27 +1435,68 @@ class MongoAPI:
     def set_user_tier(org_id, user_id, role_tier, branch_id=None):
         try:
             user = User.objects.get(id=ObjectId(user_id), org_id=int(org_id))
+            existing = MongoAPI._user_dict(user)
+            if is_super_admin_user(existing):
+                if normalize_tier(role_tier) != 'super_admin':
+                    return False
+                if branch_id:
+                    return False
             user.role_tier = role_tier
-            user.branch_id = branch_id or None
+            user.branch_id = MongoAPI._parse_user_branch_id(branch_id, org_id)
             user.save()
             return True
         except (InvalidId, User.DoesNotExist, Exception):
             return False
 
     @staticmethod
-    def branch_list(org_id, actor=None):
+    def branch_list(org_id, actor=None, for_management=False):
         MongoAPI._migrate_branch_ids_to_int(org_id)
+        MongoAPI._migrate_user_branch_ids_to_object_id(org_id)
         query = Branch.objects(org_id=int(org_id))
-        accessible = get_accessible_branch_ids(actor) if actor else 'all'
+        # Management screens need the full org catalog; record modules keep actor scoping.
+        accessible = (
+            'all'
+            if for_management or not actor
+            else MongoAPI.get_actor_accessible_branch_ids(actor, org_id)
+        )
         if accessible != 'all':
             if not accessible:
                 return []
-            query = query.filter(branch_id__in=accessible)
+            accessible_ids = [
+                parsed
+                for item in accessible
+                if (parsed := MongoAPI._parse_user_branch_id(item, org_id))
+            ]
+            if not accessible_ids:
+                return []
+            query = query.filter(id__in=accessible_ids)
         branches = list(query.order_by('name'))
-        if not branches and actor and effective_tier(actor) in ('super_admin', 'admin'):
+        if (
+            not branches
+            and actor
+            and effective_tier(actor) == 'admin'
+            and accessible == 'all'
+        ):
             MongoAPI.seed_default_branches(org_id)
             branches = list(Branch.objects(org_id=int(org_id)).order_by('name'))
         return [MongoAPI._branch_dict(branch) for branch in branches]
+
+    @staticmethod
+    def _find_branch_payload(org_id, result, fallback=None):
+        """Match a create/update result by ObjectId string or legacy integer branch_id."""
+        branches = MongoAPI.branch_list(org_id, for_management=True)
+        result_str = str(result) if result is not None else ''
+        for item in branches:
+            if item.get('id') == result_str:
+                return item
+            if result_str.isdigit() and item.get('branch_id') == int(result_str):
+                return item
+            if item.get('branch_id') == result:
+                return item
+        payload = {'id': result_str} if result_str else {}
+        if fallback:
+            payload.update(fallback)
+        return payload
 
     @staticmethod
     def branch_create(org_id, data):
@@ -680,18 +1527,32 @@ class MongoAPI:
                 manager_user_id=data.get('manager_user_id') or None,
             )
             branch.save()
-            return branch.branch_id
+            return str(branch.id)
         except (NotUniqueError, ValidationError):
             return '0'
 
     @staticmethod
-    def branch_update(org_id, branch_id, data):
+    def _get_branch_for_update(org_id, branch_id):
+        """Resolve branch by Mongo ObjectId or legacy integer branch_id."""
+        object_id = MongoAPI._parse_user_branch_id(branch_id, org_id)
+        if object_id is not None:
+            try:
+                return Branch.objects.get(org_id=int(org_id), id=object_id)
+            except Branch.DoesNotExist:
+                pass
+
         parsed_branch_id = MongoAPI._parse_branch_id(branch_id)
         if not parsed_branch_id:
-            return '0'
+            return None
         try:
-            branch = Branch.objects.get(org_id=int(org_id), branch_id=parsed_branch_id)
+            return Branch.objects.get(org_id=int(org_id), branch_id=parsed_branch_id)
         except Branch.DoesNotExist:
+            return None
+
+    @staticmethod
+    def branch_update(org_id, branch_id, data):
+        branch = MongoAPI._get_branch_for_update(org_id, branch_id)
+        if branch is None:
             return '0'
 
         if data.get('name'):
@@ -709,7 +1570,7 @@ class MongoAPI:
 
         branch.modify_date = datetime.datetime.now(timezone('UTC'))
         branch.save()
-        return branch.branch_id
+        return str(branch.id)
 
     @staticmethod
     def branch_deactivate(org_id, branch_id):
@@ -733,6 +1594,7 @@ class MongoAPI:
         info = {
             'id': str(organization.id),
             'org_id': organization.org_id,
+            'user_name': getattr(organization, 'user_name', '') or '',
             'organization_name': organization.organization_name,
             'email': organization.email,
             'signup_via': organization.signup_via,
@@ -790,8 +1652,11 @@ class MongoAPI:
     @staticmethod
     def confirm_Password(user_id, password):
         try:
-            User.objects(id=ObjectId(user_id)).update_one(password=password)
+            user = User.objects.get(id=ObjectId(user_id))
+            user.update(password=password)
             return 'Yes'
+        except (User.DoesNotExist, InvalidId):
+            return 'No'
         except Exception:
             return 'No'
 
@@ -801,9 +1666,9 @@ class MongoAPI:
         return (last_org.org_id if last_org else 0) + 1
 
     @staticmethod
-    def create_organization(email, name='', signup_via='email'):
+    def create_organization(email, name='', signup_via='email', user_name=''):
         return MongoAPI.create_organization_planData(
-            email, name, None, None, None, None, signup_via, None,
+            email, name, None, None, None, None, signup_via, None, user_name=user_name,
         )
 
     @staticmethod
@@ -817,11 +1682,13 @@ class MongoAPI:
         signup_via,
         partner_id,
         coupon='',
+        user_name='',
     ):
         try:
             last_data_id = int(LastDataId.getOrganizationLastDataId('org_id')) + 1
             organization_data = {
                 'org_id': last_data_id,
+                'user_name': user_name or '',
                 'organization_name': name or '',
                 'email': email,
                 'signup_via': signup_via or 'email',
@@ -967,18 +1834,12 @@ class MongoAPI:
 
     @staticmethod
     def create_administrator_role(org_id, user_id):
-        existing_role_id = MongoAPI.userAdministratorRole(org_id)
-        if existing_role_id and existing_role_id != 0:
-            MongoAPI.userRoleUpdate(user_id, existing_role_id)
-            return existing_role_id
-
-        role_id = MongoAPI.roleSubmit(
-            org_id,
-            user_id,
-            {'role_name': 'Administrator'},
-        )
-        MongoAPI.userRoleUpdate(user_id, role_id)
-        return role_id
+        MongoAPI.seed_default_roles(org_id, user_id)
+        admin_role_id = MongoAPI.userAdministratorRole(org_id)
+        if admin_role_id and admin_role_id != 0:
+            MongoAPI.userRoleUpdate(user_id, admin_role_id)
+            return admin_role_id
+        return '0'
 
     @staticmethod
     def updateDeviceID(org_id, user_id, device_id):
@@ -1148,6 +2009,21 @@ class MongoAPI:
         return [str(value)]
 
     @staticmethod
+    def _resolve_assigned_projects(org_id, assigned_project_ids):
+        object_ids = MongoAPI._extract_object_id_list(assigned_project_ids)
+        project_id_strings = [str(project_id) for project_id in object_ids]
+        project_names = []
+
+        for project_id in object_ids:
+            try:
+                project = Project.objects.get(id=project_id, org_id=int(org_id))
+                project_names.append(project.name or '')
+            except Project.DoesNotExist:
+                project_names.append('')
+
+        return project_id_strings, project_names
+
+    @staticmethod
     def _parse_lead_settings_info(info):
         if info is None or info == '':
             return {}
@@ -1258,6 +2134,10 @@ class MongoAPI:
                 'payment_terms',
             ])
 
+            branch_id = MongoAPI._resolve_lead_branch_id(org_id, data1, user_id)
+            if branch_id is not None:
+                data1['branch_id'] = branch_id
+
             lead = Lead.from_json(json.dumps(data1))
             lead.save()
             return str(lead.id)
@@ -1318,13 +2198,111 @@ class MongoAPI:
     def getUserDetails(org_id, user_id):
         if not user_id:
             return {}
+        user_id = MongoAPI._extract_object_id(user_id)
+        if user_id is None:
+            return {}
         try:
-            user = User.objects.get(id=ObjectId(user_id), org_id=int(org_id))
+            user = User.objects.get(id=user_id, org_id=int(org_id))
             data = MongoAPI._user_dict(user)
             data['user_id'] = data['id']
             return data
         except (User.DoesNotExist, InvalidId):
             return {}
+
+    @staticmethod
+    def get_profile_details(org_id, user_id):
+        try:
+            user = User.objects.get(id=ObjectId(user_id), org_id=int(org_id))
+            data = MongoAPI._user_dict(user)
+
+            branch_ref = getattr(user, 'branch_id', None)
+            if branch_ref:
+                branch_oid = MongoAPI._parse_user_branch_id(branch_ref, org_id)
+                if branch_oid:
+                    branch = Branch.objects(
+                        org_id=int(org_id), id=branch_oid,
+                    ).first()
+                    if branch:
+                        data['branch_name'] = branch.name
+                        data['branch_id'] = str(branch_oid)
+
+            org = Organization.objects.filter(org_id=int(org_id)).first()
+            if org:
+                data['organization_name'] = org.organization_name
+
+            return data
+        except (User.DoesNotExist, InvalidId):
+            return {}
+
+    @staticmethod
+    def update_user_profile(org_id, user_id, name, phone=None, profile_image=None):
+        try:
+            user = User.objects.get(id=ObjectId(user_id), org_id=int(org_id))
+            name = (name or '').strip()
+            updates = {
+                'name': name,
+                'phone': str(phone or ''),
+                'modify_date': datetime.datetime.now(timezone('UTC')),
+            }
+            if profile_image is not None:
+                updates['profile_image'] = profile_image
+            user.update(**updates)
+
+            # Keep organization.user_name in sync for the account owner
+            org = Organization.objects.filter(org_id=int(org_id)).first()
+            if org and name and (not getattr(org, 'user_name', None) or org.email == user.email):
+                org.user_name = name
+                org.save()
+
+            return MongoAPI.get_profile_details(org_id, user_id)
+        except (User.DoesNotExist, InvalidId):
+            return None
+
+    @staticmethod
+    def update_organization_profile(org_id, user_id, user_name='', organization_name=''):
+        try:
+            user = User.objects.get(id=ObjectId(user_id), org_id=int(org_id))
+            org = Organization.objects.filter(org_id=int(org_id)).first()
+            if not org:
+                return None
+
+            user_name = (user_name or '').strip()
+            organization_name = (organization_name or '').strip()
+
+            if user_name:
+                user.update(
+                    name=user_name,
+                    modify_date=datetime.datetime.now(timezone('UTC')),
+                )
+                if org.email == user.email:
+                    org.user_name = user_name
+
+            if organization_name:
+                org.organization_name = organization_name
+
+            org.save()
+            return MongoAPI.get_profile_details(org_id, user_id)
+        except (User.DoesNotExist, InvalidId):
+            return None
+
+    @staticmethod
+    def get_user_mail_signature(user_id):
+        try:
+            user = User.objects.get(id=ObjectId(user_id), status='active')
+            return getattr(user, 'mail_signature', '') or ''
+        except (User.DoesNotExist, InvalidId):
+            return ''
+
+    @staticmethod
+    def update_user_mail_signature(user_id, signature):
+        try:
+            User.objects(id=ObjectId(user_id)).update_one(
+                mail_signature=signature or '',
+                modify_date=datetime.datetime.now(timezone('UTC')),
+            )
+            return True
+        except Exception:
+            return False
 
     @staticmethod
     def emailSubmit(org_id, user_id, data1, email_id, attachment):
@@ -1410,11 +2388,27 @@ class MongoAPI:
             return 0
 
     @staticmethod
-    def _build_lead_base_filter(org_id, current_user):
+    def _build_lead_base_filter(org_id, current_user, branch_id=None, filter_data=None):
         match_filter = {
             'org_id': int(org_id),
             'status': 'active',
         }
+        actor = MongoAPI.getUserDetails(org_id, current_user)
+        explicit_branch = MongoAPI._branch_ids_from_filter_data(filter_data or [])
+        if branch_id not in (None, '', 'all') or explicit_branch:
+            if not MongoAPI._apply_branch_scope_to_match_filter(
+                match_filter,
+                actor,
+                filter_data=filter_data,
+                branch_id=branch_id if branch_id not in (None, '', 'all') else None,
+                org_id=org_id,
+                include_unset_branch=False,
+            ):
+                match_filter['branch_id'] = {'$in': []}
+        elif not MongoAPI._apply_branch_scope_to_match_filter(
+            match_filter, actor, org_id=org_id, include_unset_branch=True,
+        ):
+            match_filter['branch_id'] = {'$in': []}
         MongoAPI._apply_lead_visibility_filter(match_filter, org_id, current_user)
         return match_filter
 
@@ -1429,19 +2423,23 @@ class MongoAPI:
         return first_day, last_day
 
     @staticmethod
-    def lead_metrics(org_id, current_user, aging_days=7):
+    def lead_metrics(org_id, current_user, aging_days=7, branch_id=None):
         empty = {
             'active_leads': 0,
             'aging_leads': 0,
             'aging_days': int(aging_days),
             'followup_today': 0,
+            'followups_this_week': 0,
+            'pending_followups': 0,
             'created_this_week': 0,
             'converted_this_week': 0,
             'created_this_month': 0,
             'converted_this_month': 0,
         }
         try:
-            base_filter = MongoAPI._build_lead_base_filter(org_id, current_user)
+            base_filter = MongoAPI._build_lead_base_filter(
+                org_id, current_user, branch_id=branch_id,
+            )
             active_leads = Lead.objects(__raw__=base_filter).count()
 
             aging_filter = dict(base_filter)
@@ -1467,6 +2465,39 @@ class MongoAPI:
             week_start, week_end = DateFilter.date_range_filter(
                 'this_week', current_user, org_id,
             )
+            followups_this_week = 0
+            if week_start and week_end:
+                week_task_filter = {
+                    'org_id': int(org_id),
+                    'status': 'Open',
+                    'associate_to': 'lead',
+                    'date': {'$gte': week_start, '$lte': week_end},
+                }
+                week_lead_ids = Crm_tasks.objects(__raw__=week_task_filter).distinct(
+                    'associate_id',
+                )
+                if week_lead_ids:
+                    week_followup_filter = dict(base_filter)
+                    week_followup_filter['_id'] = {'$in': week_lead_ids}
+                    followups_this_week = Lead.objects(__raw__=week_followup_filter).count()
+
+            pending_followups = 0
+            today_start, _ = DateFilter.date_range_filter('today', current_user, org_id)
+            if today_start:
+                overdue_task_filter = {
+                    'org_id': int(org_id),
+                    'status': 'Open',
+                    'associate_to': 'lead',
+                    'date': {'$lt': today_start},
+                }
+                overdue_lead_ids = Crm_tasks.objects(__raw__=overdue_task_filter).distinct(
+                    'associate_id',
+                )
+                if overdue_lead_ids:
+                    overdue_followup_filter = dict(base_filter)
+                    overdue_followup_filter['_id'] = {'$in': overdue_lead_ids}
+                    pending_followups = Lead.objects(__raw__=overdue_followup_filter).count()
+
             created_week_filter = dict(base_filter)
             if week_start and week_end:
                 created_week_filter['create_date'] = {'$gte': week_start, '$lte': week_end}
@@ -1478,6 +2509,8 @@ class MongoAPI:
             }
             if week_start and week_end:
                 converted_week_filter['converted_date'] = {'$gte': week_start, '$lte': week_end}
+            if 'branch_id' in base_filter:
+                converted_week_filter['branch_id'] = base_filter['branch_id']
             MongoAPI._apply_lead_visibility_filter(converted_week_filter, org_id, current_user)
             converted_this_week = Lead.objects(__raw__=converted_week_filter).count()
 
@@ -1491,6 +2524,8 @@ class MongoAPI:
                 'status': 'converted',
                 'converted_date': {'$gte': first_day, '$lte': last_day},
             }
+            if 'branch_id' in base_filter:
+                converted_month_filter['branch_id'] = base_filter['branch_id']
             MongoAPI._apply_lead_visibility_filter(converted_month_filter, org_id, current_user)
             converted_this_month = Lead.objects(__raw__=converted_month_filter).count()
 
@@ -1499,6 +2534,8 @@ class MongoAPI:
                 'aging_leads': aging_leads,
                 'aging_days': int(aging_days),
                 'followup_today': followup_today,
+                'followups_this_week': followups_this_week,
+                'pending_followups': pending_followups,
                 'created_this_week': created_this_week,
                 'converted_this_week': converted_this_week,
                 'created_this_month': created_this_month,
@@ -1641,6 +2678,10 @@ class MongoAPI:
                 MongoAPI._apply_lead_list_object_id_filter(
                     match_filter, filter_key, selected_values, indicator,
                 )
+            elif filter_key in ('branch_id', 'branch') and selected_values:
+                MongoAPI._apply_integer_list_filter(
+                    match_filter, 'branch_id', selected_values, indicator, org_id,
+                )
             elif filter_key == 'create_by' and selected_values:
                 MongoAPI._apply_lead_list_object_id_filter(
                     match_filter, filter_key, selected_values, indicator,
@@ -1651,21 +2692,114 @@ class MongoAPI:
                 )
 
     @staticmethod
+    def _deny_assigned_to_filter(match_filter):
+        match_filter['assigned_to'] = ObjectId('000000000000000000000000')
+
+    @staticmethod
+    def _team_member_user_ids(org_id, user_details):
+        """User ObjectIds considered teammates (same branch), including the actor."""
+        actor_oid = MongoAPI._extract_object_id(
+            (user_details or {}).get('id') or (user_details or {}).get('_id'),
+        )
+        if actor_oid is None:
+            return []
+
+        branch_oid = MongoAPI._parse_user_branch_id(
+            (user_details or {}).get('branch_id'), org_id,
+        )
+        if branch_oid is None:
+            return [actor_oid]
+
+        member_ids = [
+            user.id
+            for user in User.objects(
+                org_id=int(org_id),
+                status='active',
+                branch_id=branch_oid,
+            ).only('id')
+        ]
+        if actor_oid not in member_ids:
+            member_ids.append(actor_oid)
+        return member_ids
+
+    @staticmethod
+    def _intersect_assigned_to_filter(match_filter, allowed_ids):
+        """Constrain assigned_to to allowed_ids, intersecting any existing filter."""
+        if not allowed_ids:
+            MongoAPI._deny_assigned_to_filter(match_filter)
+            return
+
+        allowed = list(allowed_ids)
+        existing = match_filter.get('assigned_to')
+        if existing is None:
+            if len(allowed) == 1:
+                match_filter['assigned_to'] = allowed[0]
+            else:
+                match_filter['assigned_to'] = {'$in': allowed}
+            return
+
+        if isinstance(existing, dict) and '$in' in existing:
+            existing_ids = {
+                oid for oid in (MongoAPI._extract_object_id(v) for v in existing['$in'])
+                if oid is not None
+            }
+        elif isinstance(existing, dict) and '$nin' in existing:
+            excluded = {
+                oid for oid in (MongoAPI._extract_object_id(v) for v in existing['$nin'])
+                if oid is not None
+            }
+            existing_ids = set(allowed) - excluded
+        else:
+            existing_oid = MongoAPI._extract_object_id(existing)
+            existing_ids = {existing_oid} if existing_oid is not None else set()
+
+        intersection = [oid for oid in allowed if oid in existing_ids]
+        if not intersection:
+            MongoAPI._deny_assigned_to_filter(match_filter)
+        elif len(intersection) == 1:
+            match_filter['assigned_to'] = intersection[0]
+        else:
+            match_filter['assigned_to'] = {'$in': intersection}
+
+    @staticmethod
     def _apply_lead_visibility_filter(match_filter, org_id, current_user):
+        """Apply lead visibility based on role view-scope permissions.
+
+        - Super Admin: all leads in existing branch/org scope
+        - lead_view_all: all leads in existing branch/org scope
+        - lead_view_team: leads assigned to users in the same branch (team)
+        - lead_view_own: only leads assigned to the current user
+        - none: deny (empty result)
+        """
         user_details = MongoAPI.getUserDetails(org_id, current_user)
-        role_details = MongoAPI.getRolesListDetails(org_id, user_details.get('role', ''))
-        lead_view_all = role_details.get('lead_view_all', 1)
-        lead_view_own = role_details.get('lead_view_own', 0)
-        lead_view_team = role_details.get('lead_view_team', 0)
+        if not user_details:
+            MongoAPI._deny_assigned_to_filter(match_filter)
+            return
+
+        role_details = MongoAPI.get_user_role_data(org_id, current_user)
+        if is_super_admin_user(user_details, role_details):
+            return
+
+        lead_view_all = int(role_details.get('lead_view_all', 0) or 0)
+        lead_view_team = int(role_details.get('lead_view_team', 0) or 0)
+        lead_view_own = int(role_details.get('lead_view_own', 0) or 0)
 
         if lead_view_all == 1:
             return
-        if lead_view_own == 1 and 'assigned_to' not in match_filter:
-            match_filter['assigned_to'] = ObjectId(current_user)
-        elif lead_view_team == 1 and 'assigned_to' not in match_filter:
-            match_filter['assigned_to'] = ObjectId(current_user)
-        elif 'assigned_to' not in match_filter:
-            match_filter['assigned_to'] = ObjectId('000000000000000000000000')
+        if lead_view_team == 1:
+            MongoAPI._intersect_assigned_to_filter(
+                match_filter,
+                MongoAPI._team_member_user_ids(org_id, user_details),
+            )
+            return
+        if lead_view_own == 1:
+            actor_oid = MongoAPI._extract_object_id(current_user)
+            MongoAPI._intersect_assigned_to_filter(
+                match_filter,
+                [actor_oid] if actor_oid is not None else [],
+            )
+            return
+        MongoAPI._deny_assigned_to_filter(match_filter)
 
     @staticmethod
     def _lead_no_search_candidates(lead_no):
@@ -2037,7 +3171,10 @@ class MongoAPI:
                     settings['contact_name'] = lookup_item.get('contact_name', '')
             elif field_name == 'assigned' and field_value:
                 for lookup_item in field_value:
-                    settings['assigned_to'] = lookup_item.get('name', '')
+                    settings['assigned_to_name'] = lookup_item.get('name', '')
+                    assignee_id = lookup_item.get('_id')
+                    if assignee_id is not None:
+                        settings['assigned_to'] = str(assignee_id)
             elif field_name == 'create_date' and field_value:
                 create_date1 = str(field_value).rstrip('Z')
                 try:
@@ -2102,7 +3239,23 @@ class MongoAPI:
                 'status': 'active',
             }
             MongoAPI._apply_lead_list_filters(match_filter, filter_data, current_user, org_id)
+            if not MongoAPI._branch_ids_from_filter_data(filter_data):
+                actor = MongoAPI.getUserDetails(org_id, current_user)
+                if not MongoAPI._apply_branch_scope_to_match_filter(
+                    match_filter, actor, org_id=org_id, include_unset_branch=True,
+                ):
+                    return [], 0
             MongoAPI._apply_lead_visibility_filter(match_filter, org_id, current_user)
+
+            search_text = (search_string or '').strip()
+            if search_text:
+                search_regex = {'$regex': search_text, '$options': 'i'}
+                match_filter['$or'] = [
+                    {'company_name': search_regex},
+                    {'name': search_regex},
+                    {'phone': search_regex},
+                    {'email': search_regex},
+                ]
 
             pipeline = [
                 {'$lookup': app_config.user_lookup},
@@ -2117,14 +3270,6 @@ class MongoAPI:
                 {'$lookup': app_config.curr_name_Lookup},
                 {'$sort': {sort: order}},
                 {'$match': match_filter},
-                {'$match': {
-                    '$or': [
-                        {'company_name': {'$regex': search_string, '$options': 'i'}},
-                        {'name': {'$regex': search_string, '$options': 'i'}},
-                        {'phone': {'$regex': search_string, '$options': 'i'}},
-                        {'email': {'$regex': search_string, '$options': 'i'}},
-                    ],
-                }},
                 {'$skip': skip},
                 {'$limit': length},
             ]
@@ -2210,6 +3355,9 @@ class MongoAPI:
             'status': project.status or 'active',
             'description': project.description or '',
             'create_by': str(project.create_by) if project.create_by else None,
+            'branch_id': MongoAPI._serialize_user_branch_id(
+                org_id, getattr(project, 'branch_id', None),
+            ),
         }
         if current_user is not None:
             data['create_date'] = MongoAPI._format_project_date(
@@ -2516,7 +3664,7 @@ class MongoAPI:
         }
 
     @staticmethod
-    def _apply_project_list_filters(match_filter, filter_data):
+    def _apply_project_list_filters(match_filter, filter_data, org_id=None):
         for data in filter_data or []:
             if 'field' not in data:
                 continue
@@ -2526,14 +3674,29 @@ class MongoAPI:
             if not selected_values:
                 continue
 
-            if filter_key == 'property_type':
+            if filter_key in ('branch_id', 'branch'):
+                MongoAPI._apply_integer_list_filter(
+                    match_filter, 'branch_id', selected_values, indicator, org_id,
+                )
+                continue
+
+            if filter_key in ('property_type', 'property_types'):
                 if indicator == 'is':
                     match_filter['property_types'] = {'$in': selected_values}
                 else:
                     match_filter['property_types'] = {'$nin': selected_values}
                 continue
 
-            if filter_key in ('status', 'location', 'rera_status'):
+            # Locality filter: UI uses area_locality; also accept legacy "location".
+            if filter_key in ('area_locality', 'location'):
+                db_field = 'area_locality' if filter_key == 'area_locality' else 'location'
+                if indicator == 'is':
+                    match_filter[db_field] = {'$in': selected_values}
+                else:
+                    match_filter[db_field] = {'$nin': selected_values}
+                continue
+
+            if filter_key in ('status', 'rera_status'):
                 if indicator == 'is':
                     match_filter[filter_key] = {'$in': selected_values}
                 else:
@@ -2591,7 +3754,14 @@ class MongoAPI:
                 skip = skip1 - length
 
             match_filter = {'org_id': int(org_id)}
-            MongoAPI._apply_project_list_filters(match_filter, filter_data)
+            MongoAPI._apply_project_list_filters(match_filter, filter_data, org_id)
+            actor = MongoAPI.getUserDetails(org_id, current_user)
+            if not MongoAPI._branch_ids_from_filter_data(filter_data):
+                if not MongoAPI._apply_branch_scope_to_match_filter(
+                    match_filter, actor, org_id=org_id,
+                ):
+                    return [], 0
+            MongoAPI._apply_project_visibility_filter(match_filter, org_id, current_user)
 
             sort_field = sort or 'create_date'
             sort_order = order if order in (1, -1) else -1
@@ -2636,11 +3806,22 @@ class MongoAPI:
         }
         try:
             org_id = int(org_id)
-            projects = Project.objects(org_id=org_id)
+            actor = MongoAPI.getUserDetails(org_id, current_user)
+            project_filter = {'org_id': org_id}
+            if not MongoAPI._apply_branch_scope_to_match_filter(
+                project_filter, actor, org_id=org_id,
+            ):
+                return empty
+
+            projects = Project.objects(__raw__=project_filter)
             total_projects = projects.count()
             active_projects = projects.filter(status='active').count()
 
-            unit_totals = ProjectUnit.objects(org_id=org_id)
+            project_ids = [project.id for project in projects.only('id')]
+            unit_filter = {'org_id': org_id}
+            if project_ids:
+                unit_filter['project_id'] = {'$in': project_ids}
+            unit_totals = ProjectUnit.objects(__raw__=unit_filter)
             total_units = unit_totals.count()
             settings_index = MongoAPI._unit_status_settings_index(org_id)
             available_units = 0
@@ -2655,18 +3836,24 @@ class MongoAPI:
             today = datetime.datetime.now()
             week_start = today - timedelta(days=today.weekday())
             week_start = week_start.replace(hour=0, minute=0, second=0, microsecond=0)
-            site_visits_this_week = ProjectSiteVisit.objects(
-                org_id=org_id,
-                create_date__gte=week_start,
-            ).count()
+            visit_filter = {
+                'org_id': org_id,
+                'create_date__gte': week_start,
+            }
+            if project_ids:
+                visit_filter['project_id__in'] = project_ids
+            site_visits_this_week = ProjectSiteVisit.objects(**visit_filter).count()
 
             first_day, last_day = MongoAPI._lead_metrics_month_range()
-            bookings_this_month = Booking.objects(
-                org_id=org_id,
-                status='active',
-                booking_date__gte=first_day,
-                booking_date__lte=last_day,
-            ).count()
+            booking_filter = {
+                'org_id': org_id,
+                'status': 'active',
+                'booking_date__gte': first_day,
+                'booking_date__lte': last_day,
+            }
+            if project_ids:
+                booking_filter['project_id__in'] = project_ids
+            bookings_this_month = Booking.objects(**booking_filter).count()
 
             return {
                 'total_projects': total_projects,
@@ -2789,10 +3976,51 @@ class MongoAPI:
             return []
 
     @staticmethod
+    def _unit_is_booking_status(status_value, settings_index):
+        """True when a unit status belongs on the bookings list (booked bucket)."""
+        entry = MongoAPI._resolve_unit_status_entry(status_value, settings_index)
+        if entry:
+            slug = (entry.get('title') or '').lower()
+            name = MongoAPI._normalize_status_name(entry.get('name'))
+            if slug in MongoAPI.BOOKING_UNIT_STATUS_SLUGS:
+                return True
+            if name in MongoAPI.BOOKING_UNIT_STATUS_SLUGS:
+                return True
+            return entry.get('bucket') == 'booked'
+
+        raw = str(status_value or '').strip().lower()
+        if raw in MongoAPI.BOOKING_UNIT_STATUS_SLUGS:
+            return True
+        return MongoAPI._bucket_from_status_slug(raw) == 'booked'
+
+    @staticmethod
     def project_booking_units_list(org_id, project_id, current_user):
-        return MongoAPI.project_units_list(
-            org_id, project_id, current_user, status='booking',
-        )
+        try:
+            settings_index = MongoAPI._unit_status_settings_index(org_id)
+            units = ProjectUnit.objects(
+                org_id=int(org_id), project_id=ObjectId(project_id),
+            ).order_by('unit_no')
+            results = []
+            for unit in units:
+                if not MongoAPI._unit_is_booking_status(unit.status, settings_index):
+                    continue
+                linked_lead_name = None
+                if unit.linked_lead_id:
+                    try:
+                        lead = Lead.objects.get(
+                            id=unit.linked_lead_id, org_id=int(org_id),
+                        )
+                        linked_lead_name = lead.name
+                    except Lead.DoesNotExist:
+                        pass
+                results.append(
+                    MongoAPI._project_unit_dict(
+                        unit, linked_lead_name, org_id, settings_index,
+                    ),
+                )
+            return results
+        except Exception:
+            return []
 
     @staticmethod
     def project_unit_submit(org_id, user_id, data1):
@@ -2886,6 +4114,7 @@ class MongoAPI:
         'available', 'hold', 'booked', 'registered', 'sold',
     })
     BOOKING_LIST_UNIT_STATUS_LABELS = frozenset({'booking'})
+    BOOKING_UNIT_STATUS_SLUGS = frozenset({'booking', 'booked', 'registered', 'sold'})
 
     @staticmethod
     def _amount_in_words_inr(amount):
@@ -2976,6 +4205,9 @@ class MongoAPI:
             'transaction_type': booking.transaction_type or '',
             'status': booking.status or 'active',
             'notes': booking.notes or '',
+            'branch_id': MongoAPI._serialize_user_branch_id(
+                org_id, getattr(booking, 'branch_id', None),
+            ),
         }
         if current_user is not None:
             data['booking_date'] = MongoAPI._format_project_date(
@@ -2995,16 +4227,71 @@ class MongoAPI:
 
     @staticmethod
     def _apply_booking_visibility_filter(match_filter, org_id, current_user):
+        """Apply booking visibility based on role view-scope permissions."""
         user_details = MongoAPI.getUserDetails(org_id, current_user)
-        role_details = MongoAPI.getRolesListDetails(org_id, user_details.get('role', ''))
-        if role_details.get('booking_view_all', 1) == 1:
-            return
-        if role_details.get('booking_view_own', 0) == 1:
-            match_filter['create_by'] = ObjectId(current_user)
-        elif role_details.get('booking_view_team', 0) == 1:
-            match_filter['create_by'] = ObjectId(current_user)
-        else:
+        if not user_details:
             match_filter['create_by'] = ObjectId('000000000000000000000000')
+            return
+
+        role_details = MongoAPI.get_user_role_data(org_id, current_user)
+        if is_super_admin_user(user_details, role_details):
+            return
+
+        booking_view_all = int(role_details.get('booking_view_all', 0) or 0)
+        booking_view_team = int(role_details.get('booking_view_team', 0) or 0)
+        booking_view_own = int(role_details.get('booking_view_own', 0) or 0)
+
+        if booking_view_all == 1:
+            return
+        if booking_view_team == 1:
+            team_ids = MongoAPI._team_member_user_ids(org_id, user_details)
+            if team_ids:
+                match_filter['create_by'] = {'$in': team_ids}
+            else:
+                match_filter['create_by'] = ObjectId('000000000000000000000000')
+            return
+        if booking_view_own == 1:
+            actor_oid = MongoAPI._extract_object_id(current_user)
+            if actor_oid is not None:
+                match_filter['create_by'] = actor_oid
+            else:
+                match_filter['create_by'] = ObjectId('000000000000000000000000')
+            return
+        match_filter['create_by'] = ObjectId('000000000000000000000000')
+
+    @staticmethod
+    def _apply_project_visibility_filter(match_filter, org_id, current_user):
+        """Apply project visibility based on role view-scope permissions."""
+        user_details = MongoAPI.getUserDetails(org_id, current_user)
+        if not user_details:
+            match_filter['create_by'] = ObjectId('000000000000000000000000')
+            return
+
+        role_details = MongoAPI.get_user_role_data(org_id, current_user)
+        if is_super_admin_user(user_details, role_details):
+            return
+
+        project_view_all = int(role_details.get('project_view_all', 0) or 0)
+        project_view_team = int(role_details.get('project_view_team', 0) or 0)
+        project_view_own = int(role_details.get('project_view_own', 0) or 0)
+
+        if project_view_all == 1:
+            return
+        if project_view_team == 1:
+            team_ids = MongoAPI._team_member_user_ids(org_id, user_details)
+            if team_ids:
+                match_filter['create_by'] = {'$in': team_ids}
+            else:
+                match_filter['create_by'] = ObjectId('000000000000000000000000')
+            return
+        if project_view_own == 1:
+            actor_oid = MongoAPI._extract_object_id(current_user)
+            if actor_oid is not None:
+                match_filter['create_by'] = actor_oid
+            else:
+                match_filter['create_by'] = ObjectId('000000000000000000000000')
+            return
+        match_filter['create_by'] = ObjectId('000000000000000000000000')
 
     @staticmethod
     def _booking_unit_ids_for_status(org_id, project_id=None, unit_status=None):
@@ -3125,6 +4412,11 @@ class MongoAPI:
 
             match_filter = {'org_id': int(org_id), 'status': 'active'}
             MongoAPI._apply_booking_visibility_filter(match_filter, org_id, current_user)
+            actor = MongoAPI.getUserDetails(org_id, current_user)
+            if not MongoAPI._apply_branch_scope_to_match_filter(
+                match_filter, actor, filter_data=filter_data, org_id=org_id,
+            ):
+                return {'rows': [], 'search_count': 0, 'summary': empty_summary}
 
             if project_id:
                 match_filter['project_id'] = ObjectId(project_id)
@@ -3269,9 +4561,15 @@ class MongoAPI:
 
             create_by = MongoAPI._extract_object_id(user_id) or ObjectId(user_id)
 
+            booking_branch_id = MongoAPI.branch_ref_to_int(
+                org_id, data1.get('branch_id'),
+            )
+            if booking_branch_id is None:
+                booking_branch_id = getattr(project, 'branch_id', None)
+
             booking = Booking(
                 org_id=int(org_id),
-                branch_id=data1.get('branch_id'),
+                branch_id=booking_branch_id,
                 project_id=project_id,
                 project_name=project.name or '',
                 unit_id=unit_id,
@@ -3761,13 +5059,15 @@ class MongoAPI:
         #     except NotUniqueError as e:
         #         return '0'
 
-        # elif associate_to=='companyattachment':
-        #     try:
-        #         obj = Document.objects(id=id)
-        #         obj.delete()
-        #         return '1'
-        #     except NotUniqueError as e:
-        #         return '0'
+        elif associate_to == 'companyattachment':
+            try:
+                obj = Document.objects(id=id, org_id=org_id).first()
+                if not obj:
+                    return '0'
+                obj.delete()
+                return '1'
+            except NotUniqueError:
+                return '0'
 
         # elif associate_to=='opportunityattachment':
         #     try:
@@ -4287,6 +5587,15 @@ class MongoAPI:
                     continue
                 if value is not None:
                     settings[field] = value
+
+            if 'branch_id' in data1:
+                resolved_branch = MongoAPI.branch_ref_to_int(org_id, data1.get('branch_id'))
+                if resolved_branch is not None:
+                    settings['branch_id'] = resolved_branch
+            elif 'assigned_to' in settings or 'assigned_to' in data1:
+                branch_id = MongoAPI._resolve_lead_branch_id(org_id, data1, current_user)
+                if branch_id is not None:
+                    settings['branch_id'] = branch_id
 
             Lead.objects(org_id=org_id, id=ObjectId(id)).update_one(**settings)
             return str(id)
@@ -5307,7 +6616,8 @@ class MongoAPI:
     def sales_lead_associates(org_id, lead_id, current_user):
         contact = MongoAPI.associate_contactList(org_id, lead_id, current_user)
         contact = Uid.fix_array(contact) if contact else []
-        users = MongoAPI.active_users_list(org_id)
+        actor = MongoAPI.getUserDetails(org_id, current_user)
+        users = MongoAPI.active_users_list(org_id, actor=actor)
         task = MongoAPI.get_all_crm_tasks_detail(org_id, lead_id, current_user)
         task = Uid.fix_array(task) if task and task != '0' else []
         teams = MongoAPI.get_teams_list(org_id)

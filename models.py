@@ -28,7 +28,13 @@ class Branch(db.Document):
 
 
 class User(db.Document):
-    meta = {'strict': False}
+    meta = {
+        'strict': False,
+        'indexes': [
+            {'fields': ['org_id', 'aadhaar_number'], 'sparse': True},
+            {'fields': ['org_id', 'pan_number'], 'sparse': True},
+        ],
+    }
 
     email = db.StringField(required=True, unique=True)
     name = db.StringField(default='')
@@ -38,7 +44,7 @@ class User(db.Document):
     password = db.StringField(default='')
     role = db.ObjectIdField()
     role_tier = db.StringField(default='branch_user')
-    branch_id = db.IntField()
+    branch_id = db.ObjectIdField()
     create_date = db.DateTimeField(default=utc_now)
     plan_start_date = db.DateTimeField()
     plan_end_date = db.DateTimeField()
@@ -46,12 +52,27 @@ class User(db.Document):
         'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday',
     ])
     verify_otp = db.StringField(default='')
+    profile_image = db.StringField(default='')
+    mail_signature = db.StringField(default='')
+    aadhaar_number = db.StringField()
+    aadhaar_document = db.StringField()
+    pan_number = db.StringField()
+    pan_document = db.StringField()
+    address = db.StringField()
+    source = db.StringField()
+    referred_by = db.StringField()
+    reference_contact_number = db.StringField()
+    passport_number = db.StringField()
+    assigned_project_ids = db.ListField(db.ObjectIdField(), default=list)
+    # Per-user overrides on top of role permissions (key -> 0/1).
+    permission_overrides = db.DictField(default=dict)
+    modify_date = db.DateTimeField()
 
 
 class Organization(db.Document):
     meta = {'strict': False}
-
     org_id = db.IntField(required=True, unique=True)
+    user_name = db.StringField(required=True, default='')
     organization_name = db.StringField(default='')
     email = db.StringField(required=True, default='')
     create_date = db.DateTimeField(default=utc_now)
@@ -70,7 +91,7 @@ class Role(db.Document):
     meta = {'strict': False}
 
     org_id = db.IntField(required=True)
-    role_name = db.StringField(required=True, default='Administrator')
+    role_name = db.StringField(required=True, default='Super Admin')
     create_by = db.ObjectIdField()
     create_date = db.DateTimeField(default=utc_now)
     # Module access (0/1)
@@ -78,6 +99,7 @@ class Role(db.Document):
     settings = db.IntField(default=0)
     company = db.IntField(default=0)
     quote = db.IntField(default=0)
+    reports = db.IntField(default=0)
     # Settings permissions
     manage_settings = db.IntField(default=0)
     manage_users = db.IntField(default=0)
@@ -88,9 +110,13 @@ class Role(db.Document):
     delete_lead = db.IntField(default=0)
     export_lead = db.IntField(default=0)
     import_lead = db.IntField(default=0)
-    lead_view_all = db.IntField(default=1)
-    lead_view_own = db.IntField(default=0)
+    lead_view_all = db.IntField(default=0)
+    lead_view_own = db.IntField(default=1)
     lead_view_team = db.IntField(default=0)
+    view_lead_documents = db.IntField(default=0)
+    add_lead_document = db.IntField(default=0)
+    download_lead_document = db.IntField(default=0)
+    delete_lead_document = db.IntField(default=0)
     # Booking module
     booking = db.IntField(default=0)
     add_booking = db.IntField(default=0)
@@ -99,6 +125,22 @@ class Role(db.Document):
     booking_view_all = db.IntField(default=1)
     booking_view_own = db.IntField(default=0)
     booking_view_team = db.IntField(default=0)
+    # Project module
+    project = db.IntField(default=0)
+    add_project = db.IntField(default=0)
+    edit_project = db.IntField(default=0)
+    delete_project = db.IntField(default=0)
+    project_view_all = db.IntField(default=1)
+    project_view_own = db.IntField(default=0)
+    project_view_team = db.IntField(default=0)
+    # Agent module
+    agent = db.IntField(default=0)
+    add_agent = db.IntField(default=0)
+    edit_agent = db.IntField(default=0)
+    delete_agent = db.IntField(default=0)
+    agent_view_all = db.IntField(default=0)
+    agent_view_own = db.IntField(default=0)
+    agent_view_team = db.IntField(default=0)
     # Notes permissions
     add_note = db.IntField(default=0)
     edit_note = db.IntField(default=0)
@@ -108,7 +150,6 @@ class Role(db.Document):
     # Organization-level RBAC permissions
     manage_branches = db.IntField(default=0)
     manage_admins = db.IntField(default=0)
-    manage_branch_managers = db.IntField(default=0)
     manage_branch_users = db.IntField(default=0)
     is_system_role = db.IntField(default=0)
 

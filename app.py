@@ -3,6 +3,9 @@ import datetime
 import json
 import os
 import random
+import re
+import secrets
+import string
 import time
 from collections import defaultdict
 from urllib.parse import unquote
@@ -28,8 +31,14 @@ from jwt_auth import (
     revoke_current_token,
     revoke_token_string,
 )
+from permissions_config import (
+    ALL_ROLE_KEYS,
+    PERMISSION_CATALOG,
+    flatten_role_permission_payload,
+)
 from rbac import (
-    branch_allowed_for_user,
+    can_manage_roles,
+    can_manage_target_user,
     can_manage_users,
     effective_tier,
     resolve_record_branch_id,
@@ -41,6 +50,11 @@ from mail_service import (
     send_signup_email,
 )
 from mongodb import MongoAPI
+from user_details_validator import (
+    has_user_detail_fields,
+    validate_user_details,
+    validate_user_document_file,
+)
 
 load_dotenv()
 
@@ -72,7 +86,7 @@ app.config['MAIL_DEFAULT_SENDER'] = os.environ.get(
     os.environ.get('MAIL_USERNAME') or app_config.DEFAULT_FROM_EMAIL,
 )
 app.config['MAIL_ENABLED'] = os.environ.get('MAIL_ENABLED', 'false').lower() == 'true'
-app.config['DEV_LOG_OTP'] = os.environ.get('DEV_LOG_OTP', 'true').lower() == 'true'
+app.config['DEV_LOG_OTP'] = os.environ.get('DEV_LOG_OTP', 'false').lower() == 'true'
 
 _PLACEHOLDER_MAIL_VALUES = {
     '',
@@ -111,6 +125,18 @@ UPLOAD_DOCUMENT_DIR = app_config.UPLOAD_OPEN_DOCUMENT_FOLDER.rstrip('/')
 app.config['UPLOAD_DOCUMENT_FOLDER'] = UPLOAD_DOCUMENT_DIR
 os.makedirs(UPLOAD_DOCUMENT_DIR, exist_ok=True)
 
+UPLOAD_PROFILE_DIR = app_config.UPLOAD_PROFILE_FOLDER.rstrip('/')
+app.config['UPLOAD_PROFILE_FOLDER'] = UPLOAD_PROFILE_DIR
+os.makedirs(UPLOAD_PROFILE_DIR, exist_ok=True)
+
+UPLOAD_USER_DOCUMENT_DIR = app_config.UPLOAD_USER_DOCUMENT_FOLDER.rstrip('/')
+app.config['UPLOAD_USER_DOCUMENT_FOLDER'] = UPLOAD_USER_DOCUMENT_DIR
+os.makedirs(UPLOAD_USER_DOCUMENT_DIR, exist_ok=True)
+
+PROFILE_PASSWORD_RE = re.compile(
+    r'^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[^A-Za-z0-9]).{8,}$',
+)
+
 
 def allowed_file(filename, allowed_extensions):
     return (
@@ -128,6 +154,39 @@ def splitpart(value, index, separator):
     return value
 
 
+def _store_safe_document_file(file):
+    """Save an uploaded document under the document folder using a sanitized name.
+
+    Returns (stored_filename, file_url, error_message).
+    """
+    if not file or not file.filename:
+        return None, None, 'No file selected for uploading'
+    if not allowed_file(file.filename, app_config.ALLOWED_EXTENSIONS):
+        return None, None, f"Allowed file types are {app_config.ALLOWED_EXTENSIONS}"
+
+    original_filename = secure_filename(file.filename)
+    if not original_filename or '.' not in original_filename:
+        return None, None, f"Allowed file types are {app_config.ALLOWED_EXTENSIONS}"
+
+    safe_base, file_format = original_filename.rsplit('.', 1)
+    file_format = file_format.lower()
+    if file_format not in app_config.ALLOWED_EXTENSIONS:
+        return None, None, f"Allowed file types are {app_config.ALLOWED_EXTENSIONS}"
+
+    stored_filename = f"{safe_base or 'file'}{time.strftime('_%d_%Y_%H_%M_%S')}.{file_format}"
+    upload_dir = app.config['UPLOAD_DOCUMENT_FOLDER']
+    os.makedirs(upload_dir, exist_ok=True)
+    dest_path = os.path.realpath(os.path.join(upload_dir, stored_filename))
+    upload_root = os.path.realpath(upload_dir)
+    if not dest_path.startswith(upload_root + os.sep):
+        return None, None, 'Invalid file name'
+    file.save(dest_path)
+    file_url = (
+        f"{app_config.BASE_URL}{app_config.UPLOAD_OPEN_DOCUMENT_FOLDER}{stored_filename}"
+    )
+    return stored_filename, file_url, None
+
+
 @app.route('/')
 @app.route('/health')
 def health_check():
@@ -135,7 +194,26 @@ def health_check():
 
 
 @app.route('/uploads/<path:filename>')
+@jwt_required(optional=True)
 def serve_upload(filename):
+    # Identity documents require authentication.
+    normalized = (filename or '').lstrip('/')
+    if normalized.startswith('user-documents/'):
+        identity = get_jwt_identity()
+        if not identity:
+            return jsonify({'msg': 'Authentication required', 'code': 401}), 401
+        user = MongoAPI.authorizationCheck(identity)
+        if not user:
+            return jsonify({'msg': 'Authentication required', 'code': 401}), 401
+        parts = normalized.split('/')
+        # user-documents/{org_id}/{user_id}/...
+        if len(parts) >= 3:
+            try:
+                doc_org_id = int(parts[1])
+            except (TypeError, ValueError):
+                return jsonify({'msg': 'Not found', 'code': 404}), 404
+            if int(user.get('org_id') or 0) != doc_org_id:
+                return jsonify({'msg': 'Access denied', 'code': 403}), 403
     return send_from_directory('uploads', filename)
 
 
@@ -226,6 +304,11 @@ def generate_otp():
     return ''.join(random.choice('0123456789') for _ in range(6))
 
 
+def generate_temp_password(length=10):
+    alphabet = string.ascii_letters + string.digits
+    return ''.join(secrets.choice(alphabet) for _ in range(length))
+
+
 def dumps_response(payload):
     return Response(json.dumps(payload, default=json_util.default), mimetype='application/json')
 
@@ -261,6 +344,60 @@ def require_manage_settings():
     return current_user, user, org_id, None
 
 
+def require_role_management():
+    current_user, user, error = require_authenticated_user()
+    if error:
+        return None, None, None, error
+    org_id = user.get('org_id')
+    role_data = MongoAPI.get_user_role_data(org_id, current_user)
+    if not can_manage_roles(user, role_data):
+        return None, None, None, (jsonify({
+            'msg': "You don't have access to manage roles",
+            'code': 403,
+        }), 403)
+    return current_user, user, org_id, None
+
+
+def require_permission_key(permission_key):
+    current_user, user, error = require_authenticated_user()
+    if error:
+        return None, None, None, error
+    org_id = user.get('org_id')
+    if not MongoAPI.user_has_permission(org_id, current_user, permission_key):
+        return None, None, None, (jsonify({
+            'msg': 'Insufficient permissions',
+            'code': 403,
+        }), 403)
+    return current_user, user, org_id, None
+
+
+def _role_mutation_error_response(result):
+    if result == 'missing_name':
+        return jsonify({'msg': 'Missing role_name parameter', 'code': 400})
+    if result == 'duplicate':
+        return jsonify({'msg': 'Role name already exists', 'code': 400})
+    if result == 'protected':
+        return jsonify({'msg': 'System role cannot be deleted', 'code': 400})
+    if result == 'protected_system_role':
+        return jsonify({'msg': 'System roles can only be edited by super admin', 'code': 403})
+    if result == 'protected_super_admin_role_name':
+        return jsonify({
+            'msg': 'Super Admin role name cannot be changed',
+            'code': 403,
+        })
+    if result == 'in_use':
+        return jsonify({'msg': 'Role is assigned to users and cannot be deleted', 'code': 400})
+    if result == 'invalid_reassign':
+        return jsonify({'msg': 'Invalid reassign_to role', 'code': 400})
+    if isinstance(result, str) and result.startswith('unknown_permission:'):
+        return jsonify({'msg': f"Unknown permission: {result.split(':', 1)[1]}", 'code': 400})
+    if isinstance(result, str) and result not in ('0',) and len(result) != 24:
+        return jsonify({'msg': result, 'code': 403})
+    if not result or result == '0':
+        return jsonify({'msg': 'Oops,Something went wrong !', 'code': 400})
+    return None
+
+
 def require_user_management():
     current_user, user, error = require_authenticated_user()
     if error:
@@ -275,18 +412,36 @@ def require_user_management():
     return current_user, user, org_id, None
 
 
+def can_view_user_in_list(actor, target):
+    actor_tier = effective_tier(actor)
+    target_tier = effective_tier(target)
+    if actor_tier == 'super_admin':
+        return True
+    if actor_tier == 'admin':
+        return target_tier != 'super_admin'
+    if target_tier in ('super_admin', 'admin'):
+        return False
+    actor_branch = str(actor.get('branch_id') or '')
+    target_branch = str(target.get('branch_id') or '')
+    if actor_branch and target_branch and actor_branch == target_branch:
+        return True
+    return str(actor.get('id') or '') == str(target.get('id') or '')
+
+
 def require_branch_management():
     current_user, user, error = require_authenticated_user()
     if error:
         return None, None, None, error
     org_id = user.get('org_id')
     tier = effective_tier(user)
-    if tier not in ('super_admin', 'admin'):
-        return None, None, None, (jsonify({
-            'msg': "You don't have access to manage branches",
-            'code': 403,
-        }), 403)
-    return current_user, user, org_id, None
+    if tier in ('super_admin', 'admin'):
+        return current_user, user, org_id, None
+    if MongoAPI.user_has_permission(org_id, current_user, 'manage_branches'):
+        return current_user, user, org_id, None
+    return None, None, None, (jsonify({
+        'msg': "You don't have access to manage branches",
+        'code': 403,
+    }), 403)
 
 
 def build_login_payload(user_id, org_id):
@@ -367,6 +522,8 @@ def login():
     if response['status'] == 'inactive':
         return jsonify({'msg': 'Your account is inactive, Please contact Admin', 'code': 400})
 
+    MongoAPI._migrate_user_branch_ids_to_object_id(response['org_id'])
+
     organization = MongoAPI.organizationInfo(response['org_id'])
     role_data = build_role_data(response['org_id'], response['id'])
     plan_data = MongoAPI.get_plan_data(response['org_id'])
@@ -440,6 +597,12 @@ def userSignUp():
         return jsonify({'msg': 'Missing JSON in request'})
 
     email = request.json.get('email', None)
+    user_name = (
+        request.json.get('user_name')
+        or request.json.get('name')
+        or ''
+    ).strip()
+    organization_name = (request.json.get('organization_name') or '').strip()
     plan_id = request.json.get('plan_id', None)
     trial = request.json.get('trial', None)
     plan_start_date = request.json.get('plan_start_date', None)
@@ -464,7 +627,16 @@ def userSignUp():
 
     signup_via = 'email'
     org_id = MongoAPI.create_organization_planData(
-        email, '', plan_id, trial, plan_start_date, plan_end_date, signup_via, partner_id,
+        email,
+        organization_name,
+        plan_id,
+        trial,
+        plan_start_date,
+        plan_end_date,
+        signup_via,
+        partner_id,
+        coupon=coupon,
+        user_name=user_name,
     )
     if org_id == '0':
         return jsonify({'msg': 'Oops,Something went wrong !', 'code': 400})
@@ -473,7 +645,7 @@ def userSignUp():
     password = base64.b64encode(''.encode())
     verify_otp = ''.join(random.choice('0123456789') for _ in range(6))
     response1 = MongoAPI.createUser_plan(
-        email, password, '', org_id, create_date, plan_start_date, plan_end_date, verify_otp,
+        email, password, user_name, org_id, create_date, plan_start_date, plan_end_date, verify_otp,
     )
 
     if response1:
@@ -634,37 +806,69 @@ def forgot_password_check():
     if not request.is_json:
         return jsonify({'msg': 'Missing JSON in request', 'code': 400})
 
-    email = request.json.get('email')
+    email = (request.json.get('email') or '').strip().lower()
     if not email:
         return jsonify({'msg': 'Missing email in request', 'code': 400})
-
-    if MongoAPI.emailCheck(email) != 'Yes':
-        return jsonify({'msg': 'Invalid Email', 'code': 400})
 
     user_data = MongoAPI.get_user_by_email(email)
     if user_data == 'no such name':
         return jsonify({'msg': 'Invalid Email', 'code': 400})
 
-    send_auth_email(
+    if user_data.get('status') == 'inactive':
+        return jsonify({
+            'msg': 'Your account is inactive, Please contact Admin',
+            'code': 400,
+        })
+
+    generated_password = generate_temp_password()
+    encoded_password = encode_password(generated_password)
+    previous_password = MongoAPI.get_user_password_hash(user_data['id'])
+
+    if MongoAPI.confirm_Password(user_data['id'], encoded_password) != 'Yes':
+        return jsonify({'msg': 'Oops,Something went wrong !', 'code': 400})
+
+    if app.config.get('DEV_LOG_OTP'):
+        print(
+            f'\n[DEV PASSWORD] Temporary password for {email}\n'
+            f'[DEV PASSWORD] Password: {generated_password}\n'
+        )
+
+    email_sent = send_auth_email(
         email,
-        'Reset Your MAP Password',
-        render_auth_email('forgot_password.html', user_data['id']),
+        'Your MAP Password',
+        render_auth_email(
+            'forgot_password.html',
+            user_data['id'],
+            generated_password=generated_password,
+            user_name=user_data.get('name') or '',
+        ),
     )
+    if not email_sent:
+        # Restore previous password so a mail failure cannot lock the account out.
+        if previous_password:
+            MongoAPI.confirm_Password(user_data['id'], previous_password)
+        return jsonify({
+            'msg': 'Failed to send password email. Check MAIL_ENABLED and Gmail SMTP settings in .env',
+            'code': 400,
+        })
+
     return jsonify({'msg': 'Email sent successfully.', 'code': 200})
 
 
 @app.route('/creat_new_password', methods=['POST'])
+@jwt_required()
 def creat_new_password():
     if not request.is_json:
         return jsonify({'msg': 'Missing JSON in request', 'code': 400})
 
+    current_user = get_jwt_identity()
     new_password = request.json.get('new_password')
-    user_id = request.json.get('user_id')
+    user_id = request.json.get('user_id') or current_user
 
     if not new_password:
         return jsonify({'msg': 'Missing new password parameter', 'code': 400})
-    if not user_id:
-        return jsonify({'msg': 'Missing user_id parameter', 'code': 400})
+    if str(user_id) != str(current_user):
+        return jsonify({'msg': 'You can only reset your own password', 'code': 403})
 
     if MongoAPI.confirm_Password(user_id, encode_password(new_password)) == 'Yes':
         user = MongoAPI.authorizationCheck(user_id)
@@ -707,6 +911,12 @@ def add_lead():
         return jsonify({'msg': 'Missing Name parameter', 'code': 400})
 
     org_id = int(ordId)
+    if not MongoAPI.user_has_permission(org_id, current_user, 'add_lead'):
+        return jsonify({
+            'msg': "You don't have permission to add leads",
+            'code': 403,
+        }), 403
+
     data1 = json.loads(json_util.dumps(request.json))
     numbering = None
     lead_no = None
@@ -759,8 +969,11 @@ def add_lead():
 
         lead_list_id = response.get('_id')
         lead_assgined_to = response.get('assigned_to')
+        assigned_to_id = MongoAPI._extract_object_id(
+            request.json.get('assigned_to') or lead_assgined_to,
+        )
 
-        user_details = MongoAPI.getUserDetails(org_id, lead_assgined_to)
+        user_details = MongoAPI.getUserDetails(org_id, assigned_to_id)
         user_details = Uid.fix_array5(user_details)
         user_id = user_details.get('user_id')
 
@@ -779,7 +992,7 @@ def add_lead():
             company_id=lead_list_id,
         )
 
-        if lead_assgined_to and lead_assgined_to != current_user and email:
+        if assigned_to_id and str(assigned_to_id) != current_user and email:
             mail_data = defaultdict(list)
             mail_data['subject'] = 'Lead Reminder'
             mail_data['content'] = sales_lead_reminder
@@ -845,7 +1058,10 @@ def get_lead_metrics():
     except (ValueError, TypeError):
         aging_days = 7
 
-    metrics = MongoAPI.lead_metrics(int(org_id), current_user, aging_days)
+    branch_id = request.args.get('branch_id') or request.args.get('branch')
+    metrics = MongoAPI.lead_metrics(
+        int(org_id), current_user, aging_days, branch_id=branch_id,
+    )
 
     resp = jsonify({'code': 200, 'data': metrics})
     resp.headers['Cache-Control'] = 'no-cache, no-store, must-revalidate'
@@ -872,10 +1088,11 @@ def add_project():
 
     org_id = int(org_id)
     data1 = json.loads(json_util.dumps(request.json))
-    branch_id = resolve_record_branch_id(user, data1.get('branch_id'))
+    branch_ref = resolve_record_branch_id(user, data1.get('branch_id'))
+    branch_id = MongoAPI.branch_ref_to_int(org_id, branch_ref)
     if branch_id and not MongoAPI.branch_exists(org_id, branch_id):
         return jsonify({'msg': 'Invalid branch_id', 'code': 400})
-    if branch_id and not branch_allowed_for_user(user, branch_id):
+    if branch_id and not MongoAPI.branch_allowed_for_record(user, org_id, branch_id):
         return jsonify({'msg': 'You do not have access to this branch', 'code': 403})
     if branch_id:
         data1['branch_id'] = branch_id
@@ -1048,11 +1265,18 @@ def add_booking():
         return jsonify({'msg': 'Missing JSON in request', 'code': 400})
 
     org_id = int(org_id)
+    if not MongoAPI.user_has_permission(org_id, current_user, 'add_booking'):
+        return jsonify({
+            'msg': "You don't have permission to add bookings",
+            'code': 403,
+        }), 403
+
     data1 = json.loads(json_util.dumps(request.json))
-    branch_id = resolve_record_branch_id(user, data1.get('branch_id'))
+    branch_ref = resolve_record_branch_id(user, data1.get('branch_id'))
+    branch_id = MongoAPI.branch_ref_to_int(org_id, branch_ref)
     if branch_id and not MongoAPI.branch_exists(org_id, branch_id):
         return jsonify({'msg': 'Invalid branch_id', 'code': 400})
-    if branch_id and not branch_allowed_for_user(user, branch_id):
+    if branch_id and not MongoAPI.branch_allowed_for_record(user, org_id, branch_id):
         return jsonify({'msg': 'You do not have access to this branch', 'code': 403})
     if branch_id:
         data1['branch_id'] = branch_id
@@ -1539,24 +1763,12 @@ def project_documents():
 
     if 'file' in request.files and request.files['file'].filename:
         file = request.files['file']
-        if not allowed_file(file.filename, app_config.ALLOWED_EXTENSIONS):
-            return jsonify({
-                'msg': f"Allowed file types are {app_config.ALLOWED_EXTENSIONS}",
-                'code': 400,
-            })
-        original_filename = secure_filename(file.filename)
-        file_format = splitpart(file.filename, -1, '.')
-        file_name = splitpart(file.filename, 0, '.')
-        stored_filename = (
-            file_name + time.strftime('_%d_%Y_%H_%M_%S') + '.' + file_format
-        )
-        upload_dir = app.config['UPLOAD_DOCUMENT_FOLDER']
-        file.save(os.path.join(upload_dir, stored_filename))
-        file_url = (
-            f"{app_config.BASE_URL}{app_config.UPLOAD_OPEN_DOCUMENT_FOLDER}{stored_filename}"
-        )
+        stored_filename, stored_url, store_err = _store_safe_document_file(file)
+        if store_err:
+            return jsonify({'msg': store_err, 'code': 400})
+        file_url = stored_url
         if not name:
-            name = original_filename
+            name = secure_filename(file.filename) or stored_filename
 
     if not file_url:
         return jsonify({'msg': 'Missing file or file_url parameter', 'code': 400})
@@ -1606,24 +1818,12 @@ def project_documents_by_project(project_id):
 
     if 'file' in request.files and request.files['file'].filename:
         file = request.files['file']
-        if not allowed_file(file.filename, app_config.ALLOWED_EXTENSIONS):
-            return jsonify({
-                'msg': f"Allowed file types are {app_config.ALLOWED_EXTENSIONS}",
-                'code': 400,
-            })
-        original_filename = secure_filename(file.filename)
-        file_format = splitpart(file.filename, -1, '.')
-        file_name = splitpart(file.filename, 0, '.')
-        stored_filename = (
-            file_name + time.strftime('_%d_%Y_%H_%M_%S') + '.' + file_format
-        )
-        upload_dir = app.config['UPLOAD_DOCUMENT_FOLDER']
-        file.save(os.path.join(upload_dir, stored_filename))
-        file_url = (
-            f"{app_config.BASE_URL}{app_config.UPLOAD_OPEN_DOCUMENT_FOLDER}{stored_filename}"
-        )
+        stored_filename, stored_url, store_err = _store_safe_document_file(file)
+        if store_err:
+            return jsonify({'msg': store_err, 'code': 400})
+        file_url = stored_url
         if not name:
-            name = original_filename
+            name = secure_filename(file.filename) or stored_filename
 
     if not file_url:
         return jsonify({'msg': 'Missing file or file_url parameter', 'code': 400})
@@ -1676,6 +1876,19 @@ def bulk_delete():
 
         org_id = int(ordId)
 
+        delete_permission_map = {
+            'lead': 'delete_lead',
+            'project': 'delete_project',
+            'booking': 'delete_booking',
+            'companyattachment': 'delete_lead_document',
+            'opportunityattachment': 'delete_lead_document',
+        }
+        required_permission = delete_permission_map.get(associate_to)
+        if required_permission and not MongoAPI.user_has_permission(
+            org_id, current_user, required_permission
+        ):
+            return jsonify({"msg": "Insufficient permissions", "code": 403}), 403
+
         if org_id:
             response1 = MongoAPI.bulk_delete(org_id,current_user,ObjectId(id),associate_to)
             response = json.loads(json_util.dumps(response1))
@@ -1722,22 +1935,9 @@ def bulk_delete():
 
 
             if data:
-                # action = 'DELETE'
-                # associate_to = associate_to
-                # associate_id = id
-                # via = 0
-                # extra_info = json.loads(json_util.dumps(request.args))
-                # text_info = 'DELETE'
-                # title = 'DELETE'
-
-                # from_data = None
-                # to_data = None
-                # category_name = "delete"
-
-
-                # MongoAPI.user_activity(ordId, current_user, from_data, to_data, category_name, action, associate_to, associate_id, via, extra_info, text_info, title)
-
-                return jsonify({"msg": mes,"code": 200})
+                if str(response) == '1':
+                    return jsonify({"msg": mes,"code": 200})
+                return jsonify({"msg": "Failed to delete record","code": 400})
             else:
                 return jsonify({"msg": "Oops,Something went wrong !","code": 400})
         else:
@@ -2241,46 +2441,26 @@ def getNotes():
     current_user = get_jwt_identity()
     user = MongoAPI.authorizationCheck(current_user)
 
-    ordId = ''
-    for user2 in user:
-        if user2=='org_id':
-            ordId = user[user2]
+    org_id = user.get('org_id') if user else None
+    if not org_id:
+        return jsonify({"msg": "Oops,Something went wrong !", "code": 400})
 
-    if ordId=='':
-        return jsonify({"msg": "Oops,Something went wrong !","code": 400})
-    else:
-        if not request.args.get:
-            return jsonify({"msg": "Missing JSON in request"})
+    associate_id = request.args.get('associate_id')
+    associate_to = request.args.get('associate_to')
 
-        id =  request.args.get('associate_id', None)
-        associate_to =  request.args.get('associate_to', None)
+    if not associate_id:
+        return jsonify({"msg": "Missing associate id parameter", "code": 400})
+    if not associate_to:
+        return jsonify({"msg": "Missing associate to parameter", "code": 400})
 
-        if not id:
-            return jsonify({"msg": "Missing associate id parameter","code": 400})
-        if not associate_to:
-            return jsonify({"msg": "Missing associate to parameter","code": 400})
+    try:
+        associate_object_id = ObjectId(associate_id)
+    except Exception:
+        return jsonify({"msg": "Invalid associate id parameter", "code": 400})
 
-        data1 = json.loads(json_util.dumps(request.json))
-
-        data = data1
-
-        org_id = int(ordId)
-
-        if org_id:
-            response1 = MongoAPI.getNotes(org_id,current_user,ObjectId(id),associate_to)
-            response = json.loads(json_util.dumps(response1))
-            # response = response1.to_json()
-            # print (response)
-            data = {'notes':response}
-            # print('time')
-            # print(datetime.datetime.utcnow())
-            if data:
-                # print (response)
-                return jsonify({"msg": "Notes list","code": 200,"data": data})
-            else:
-                return jsonify({"msg": "Oops,Something went wrong !","code": 400})
-        else:
-            return jsonify({"msg": "Oops,Something went wrong !","code": 400})
+    response1 = MongoAPI.getNotes(int(org_id), current_user, associate_object_id, associate_to)
+    response = json.loads(json_util.dumps(response1))
+    return jsonify({"msg": "Notes list", "code": 200, "data": {'notes': response}})
 
 
 @app.route('/addleadsettings', methods=['POST'])
@@ -2292,13 +2472,22 @@ def addleadsettings():
     if not org_id:
         return jsonify({'msg': 'Oops,Something went wrong !', 'code': 400})
 
+    if not MongoAPI.user_has_permission(org_id, current_user, 'manage_lead_settings'):
+        return jsonify({
+            'msg': "You don't have permission to manage lead settings",
+            'code': 403,
+        }), 403
+
     if not request.is_json:
         return jsonify({'msg': 'Missing JSON in request', 'code': 400})
 
     field_type = request.json.get('type', None)
     name = request.json.get('name', None)
     info = request.json.get('info', '')
-    default = int(request.json.get('default', 0) or 0)
+    try:
+        default = int(request.json.get('default', 0) or 0)
+    except (TypeError, ValueError):
+        return jsonify({'msg': 'Invalid default parameter', 'code': 400})
     color = request.json.get('color', '')
     weightage = request.json.get('weightage', '')
 
@@ -2376,13 +2565,22 @@ def updateleadsettings(id):
     if not org_id:
         return jsonify({'msg': 'Oops,Something went wrong !', 'code': 400})
 
+    if not MongoAPI.user_has_permission(org_id, current_user, 'manage_lead_settings'):
+        return jsonify({
+            'msg': "You don't have permission to manage lead settings",
+            'code': 403,
+        }), 403
+
     if not request.is_json:
         return jsonify({'msg': 'Missing JSON in request', 'code': 400})
 
     field_type = request.json.get('type', None)
     name = request.json.get('name', None)
     info = request.json.get('info', '')
-    default = int(request.json.get('default', 0) or 0)
+    try:
+        default = int(request.json.get('default', 0) or 0)
+    except (TypeError, ValueError):
+        return jsonify({'msg': 'Invalid default parameter', 'code': 400})
     color = request.json.get('color', '')
     weightage = request.json.get('weightage', '')
 
@@ -2410,6 +2608,12 @@ def deleteleadsettings(id):
     if not org_id:
         return jsonify({'msg': 'Oops,Something went wrong !', 'code': 400})
 
+    if not MongoAPI.user_has_permission(org_id, current_user, 'manage_lead_settings'):
+        return jsonify({
+            'msg': "You don't have permission to manage lead settings",
+            'code': 403,
+        }), 403
+
     response = MongoAPI.deleteleadSettings(id, org_id)
     if response == 'Yes':
         return jsonify({'msg': 'Settings successfully deleted !', 'code': 200})
@@ -2424,6 +2628,12 @@ def leadsettings_default(id):
     org_id = user.get('org_id')
     if not org_id:
         return jsonify({'msg': 'Oops,Something went wrong !', 'code': 400})
+
+    if not MongoAPI.user_has_permission(org_id, current_user, 'manage_lead_settings'):
+        return jsonify({
+            'msg': "You don't have permission to manage lead settings",
+            'code': 403,
+        }), 403
 
     if not request.is_json:
         return jsonify({'msg': 'Missing JSON in request', 'code': 400})
@@ -2455,7 +2665,10 @@ def addprojectsettings():
     field_type = request.json.get('type', None)
     name = (request.json.get('name', None) or '').strip()
     info = request.json.get('info', '')
-    default = int(request.json.get('default', 0) or 0)
+    try:
+        default = int(request.json.get('default', 0) or 0)
+    except (TypeError, ValueError):
+        return jsonify({'msg': 'Invalid default parameter', 'code': 400})
     color = request.json.get('color', '')
     weightage = request.json.get('weightage', '')
     title = request.json.get('title', '')
@@ -2529,7 +2742,10 @@ def updateprojectsettings(id):
     field_type = request.json.get('type', None)
     name = (request.json.get('name', None) or '').strip()
     info = request.json.get('info', '')
-    default = int(request.json.get('default', 0) or 0)
+    try:
+        default = int(request.json.get('default', 0) or 0)
+    except (TypeError, ValueError):
+        return jsonify({'msg': 'Invalid default parameter', 'code': 400})
     color = request.json.get('color', '')
     weightage = request.json.get('weightage', '')
     title = request.json.get('title', None)
@@ -2690,15 +2906,50 @@ def users_list():
     order = -1 if order_str.lower() == 'desc' else 1
     search = request.args.get('search', '') or ''
     status = request.args.get('status') or None
+    branch_id = request.args.get('branch_id')
+    filter_data = request.args.get('filter', [])
+    if isinstance(filter_data, str):
+        try:
+            filter_data = json.loads(filter_data) if filter_data else []
+        except (json.JSONDecodeError, ValueError):
+            filter_data = []
 
     users = MongoAPI.users_list(
-        org_id, search=search, sort=sort, order=order, status=status, actor=user,
+        org_id,
+        search=search,
+        sort=sort,
+        order=order,
+        status=status,
+        actor=user,
+        branch_id=branch_id,
+        filter_data=filter_data,
     )
     return jsonify({
         'code': 200,
-        'msg': 'Users list',
+        'msg': 'Success',
         'data': users,
         'total_count': len(users),
+    })
+
+
+@app.route('/usersList/<user_id>', methods=['GET'])
+@jwt_required()
+def users_list_details(user_id):
+    current_user, user, org_id, error = require_user_management()
+    if error:
+        return error
+
+    user_data = MongoAPI.getUserDetails(org_id, user_id)
+    if not user_data:
+        return jsonify({'msg': 'User not found', 'code': 404, 'data': None}), 404
+
+    if not can_view_user_in_list(user, user_data):
+        return jsonify({'msg': 'You cannot view this user', 'code': 403, 'data': None}), 403
+
+    return jsonify({
+        'code': 200,
+        'msg': 'Success',
+        'data': user_data,
     })
 
 
@@ -2722,12 +2973,16 @@ def add_user():
 
     if not data.get('password'):
         data['password'] = encode_password(os.urandom(8).hex())
+    else:
+        data['password'] = encode_password(data['password'])
 
     result = MongoAPI.add_user(org_id, data, current_user, actor=user)
     if result == 'missing_email':
         return jsonify({'msg': 'Missing email parameter', 'code': 400})
     if result == 'email_exists':
         return jsonify({'msg': 'Email id is already registered', 'code': 400})
+    if result == 'role_required':
+        return jsonify({'msg': 'Role is required', 'code': 400})
     if isinstance(result, str) and result not in ('0',) and len(result) != 24:
         return jsonify({'msg': result, 'code': 403})
     if not result or result == '0':
@@ -2748,23 +3003,110 @@ def user_update(id):
     if error:
         return error
 
-    if not request.is_json:
-        return jsonify({'msg': 'Missing JSON in request', 'code': 400})
+    is_multipart = (
+        request.content_type and 'multipart/form-data' in request.content_type
+    )
+    existing_user = MongoAPI.getUserDetails(org_id, id)
+    if not existing_user:
+        return jsonify({'msg': 'User not found', 'code': 400, 'data': None})
 
-    data = request.json or {}
+    uploaded_doc_field = None
+    response_msg = 'User updated successfully'
+
+    if is_multipart:
+        data = {key: request.form.get(key) for key in request.form}
+        # Ignore empty optional scalars so document-only uploads do not wipe fields.
+        data = {
+            key: value for key, value in data.items()
+            if value is not None and str(value).strip() != ''
+        }
+
+        if 'aadhaar_document' in request.files and request.files['aadhaar_document'].filename:
+            stored, err = _save_user_document(
+                request.files['aadhaar_document'], org_id, id, 'aadhaar',
+                existing_user.get('aadhaar_document'),
+            )
+            if err:
+                return jsonify({'msg': err, 'code': 400, 'data': None})
+            data['aadhaar_document'] = stored
+            uploaded_doc_field = 'aadhaar_document'
+
+        if 'pan_document' in request.files and request.files['pan_document'].filename:
+            stored, err = _save_user_document(
+                request.files['pan_document'], org_id, id, 'pan',
+                existing_user.get('pan_document'),
+            )
+            if err:
+                return jsonify({'msg': err, 'code': 400, 'data': None})
+            data['pan_document'] = stored
+            uploaded_doc_field = 'pan_document'
+
+        if uploaded_doc_field:
+            response_msg = 'Document uploaded successfully'
+        if has_user_detail_fields(data):
+            validation_errors = validate_user_details(
+                data,
+                require_documents=False,
+                existing_user=existing_user,
+            )
+            if validation_errors:
+                return jsonify({
+                    'msg': validation_errors[0],
+                    'code': 400,
+                    'data': None,
+                })
+    else:
+        if not request.is_json:
+            return jsonify({'msg': 'Missing JSON in request', 'code': 400, 'data': None})
+        data = request.json or {}
+        if has_user_detail_fields(data):
+            validation_errors = validate_user_details(
+                data,
+                require_documents=False,
+                existing_user=existing_user,
+            )
+            if validation_errors:
+                return jsonify({
+                    'msg': validation_errors[0],
+                    'code': 400,
+                    'data': None,
+                })
+
     result = MongoAPI.user_update(org_id, id, data, actor=user)
     if result == 'email_exists':
-        return jsonify({'msg': 'Email id is already registered', 'code': 400})
+        return jsonify({'msg': 'Email id is already registered', 'code': 400, 'data': None})
+    if result == 'aadhaar_exists':
+        return jsonify({
+            'msg': 'Aadhaar number is already registered for another user',
+            'code': 400,
+            'data': None,
+        })
+    if result == 'pan_exists':
+        return jsonify({
+            'msg': 'PAN number is already registered for another user',
+            'code': 400,
+            'data': None,
+        })
     if isinstance(result, str) and result not in ('0',) and len(result) != 24:
-        return jsonify({'msg': result, 'code': 403})
+        return jsonify({'msg': result, 'code': 403, 'data': None})
     if not result or result == '0':
-        return jsonify({'msg': 'Oops,Something went wrong !', 'code': 400})
+        return jsonify({'msg': 'Oops,Something went wrong !', 'code': 400, 'data': None})
 
     user_data = MongoAPI.getUserDetails(org_id, id)
+    if uploaded_doc_field:
+        doc_path = user_data.get(uploaded_doc_field)
+        response_data = {uploaded_doc_field: doc_path}
+        if uploaded_doc_field == 'aadhaar_document':
+            response_data['aadhaar_doc'] = doc_path
+        elif uploaded_doc_field == 'pan_document':
+            response_data['pan_doc'] = doc_path
+    else:
+        response_data = user_data
+
     return jsonify({
         'code': 200,
-        'msg': 'User successfully updated !',
-        'data': user_data,
+        'msg': response_msg,
+        'data': response_data,
     })
 
 
@@ -2800,88 +3142,316 @@ def user_change_status(id):
     })
 
 
+def _save_profile_image(file):
+    if not file or not file.filename:
+        return None, None
+    ext = file.filename.rsplit('.', 1)[-1].lower()
+    if ext not in app_config.PROFILE_ALLOWED_EXTENSIONS:
+        return None, 'Invalid file type. Allowed: JPG, JPEG, PNG, WEBP'
+    content_type = (file.content_type or '').lower()
+    if content_type and content_type not in app_config.PROFILE_ALLOWED_MIME_TYPES:
+        return None, 'Invalid file type. Allowed: JPG, JPEG, PNG, WEBP'
+    file.seek(0, os.SEEK_END)
+    size = file.tell()
+    file.seek(0)
+    if size > app_config.PROFILE_MAX_SIZE_BYTES:
+        return None, 'Profile image must be under 512 KB'
+    filename = secure_filename(file.filename)
+    name, ext = os.path.splitext(filename)
+    bare_name = f"{name}_{int(time.time())}{ext}"
+    upload_dir = app.config['UPLOAD_PROFILE_FOLDER']
+    os.makedirs(upload_dir, exist_ok=True)
+    file.save(os.path.join(upload_dir, bare_name))
+    # Store path relative to /uploads so clients can use BASE_URL + uploads/<path>
+    return f"profile/{bare_name}", None
+
+
+def _delete_user_document_file(relative_path):
+    if not relative_path:
+        return
+    normalized = relative_path.lstrip('/')
+    if normalized.startswith('uploads/'):
+        normalized = normalized[len('uploads/'):]
+    full_path = os.path.join('uploads', normalized)
+    if os.path.isfile(full_path):
+        try:
+            os.remove(full_path)
+        except OSError:
+            pass
+
+
+def _save_user_document(file, org_id, user_id, doc_type, previous_path=None):
+    err = validate_user_document_file(
+        file,
+        app_config.USER_DOCUMENT_ALLOWED_EXTENSIONS,
+        app_config.USER_DOCUMENT_ALLOWED_MIME_TYPES,
+        app_config.USER_DOCUMENT_MAX_SIZE_BYTES,
+    )
+    if err:
+        return None, err
+
+    filename = secure_filename(file.filename)
+    name, ext = os.path.splitext(filename)
+    if not ext and file.content_type == 'application/pdf':
+        ext = '.pdf'
+    stored_name = f"{doc_type}_{int(time.time())}_{name}{ext}"
+    upload_dir = os.path.join(
+        app.config['UPLOAD_USER_DOCUMENT_FOLDER'],
+        str(org_id),
+        str(user_id),
+    )
+    os.makedirs(upload_dir, exist_ok=True)
+    file.save(os.path.join(upload_dir, stored_name))
+
+    if previous_path:
+        _delete_user_document_file(previous_path)
+
+    relative_path = f"user-documents/{org_id}/{user_id}/{stored_name}"
+    return relative_path, None
+
+
+@app.route('/profile_datas', methods=['GET'])
+@jwt_required()
+def get_profile_datas():
+    current_user, user, error = require_authenticated_user()
+    if error:
+        return error
+    org_id = user.get('org_id')
+    profile = MongoAPI.get_profile_details(org_id, current_user)
+    if not profile:
+        return jsonify({'msg': 'Profile not found', 'code': 404}), 404
+    return jsonify({
+        'code': 200,
+        'msg': 'Profile retrieved successfully',
+        'data': profile,
+    })
+
+
+@app.route('/profile_datas', methods=['PUT'])
+@jwt_required()
+def update_profile_datas():
+    current_user, user, error = require_authenticated_user()
+    if error:
+        return error
+    org_id = user.get('org_id')
+    name = (request.form.get('name') or '').strip()
+    phone = request.form.get('phone', '')
+    if not name:
+        return jsonify({'msg': 'Name is required', 'code': 400}), 400
+
+    profile_image = None
+    if 'profile_image' in request.files:
+        stored, err = _save_profile_image(request.files['profile_image'])
+        if err:
+            return jsonify({'msg': err, 'code': 400}), 400
+        if stored:
+            profile_image = stored
+
+    updated = MongoAPI.update_user_profile(
+        org_id, current_user, name, phone, profile_image,
+    )
+    if not updated:
+        return jsonify({'msg': 'Failed to update profile', 'code': 400}), 400
+    return jsonify({
+        'code': 200,
+        'msg': 'Profile updated successfully',
+        'data': updated,
+    })
+
+
+@app.route('/organization_profile', methods=['PUT'])
+@jwt_required()
+def update_organization_profile():
+    current_user, user, error = require_authenticated_user()
+    if error:
+        return error
+    if not request.is_json:
+        return jsonify({'msg': 'Missing JSON in request', 'code': 400}), 400
+
+    org_id = user.get('org_id')
+    user_name = (
+        request.json.get('user_name')
+        or request.json.get('name')
+        or request.json.get('username')
+        or ''
+    ).strip()
+    organization_name = (
+        request.json.get('organization_name')
+        or request.json.get('orgname')
+        or ''
+    ).strip()
+
+    if not user_name:
+        return jsonify({'msg': 'User name is required', 'code': 400}), 400
+    if not organization_name:
+        return jsonify({'msg': 'Organization name is required', 'code': 400}), 400
+
+    updated = MongoAPI.update_organization_profile(
+        org_id,
+        current_user,
+        user_name,
+        organization_name,
+    )
+    if not updated:
+        return jsonify({'msg': 'Failed to update organization profile', 'code': 400}), 400
+
+    organization = MongoAPI.organizationInfo(org_id)
+    return jsonify({
+        'code': 200,
+        'msg': 'Organization profile updated successfully',
+        'data': updated,
+        'organization': organization,
+    })
+
+
+@app.route('/change_Password', methods=['PUT'])
+@jwt_required()
+def change_password():
+    current_user, user, error = require_authenticated_user()
+    if error:
+        return error
+    if not request.is_json:
+        return jsonify({'msg': 'Missing JSON in request', 'code': 400}), 400
+
+    new_password = request.json.get('new_password', '')
+    if not new_password:
+        return jsonify({'msg': 'Missing new_password parameter', 'code': 400}), 400
+    if not PROFILE_PASSWORD_RE.match(new_password):
+        return jsonify({
+            'msg': (
+                'Password must be at least 8 characters and include uppercase, '
+                'lowercase, number, and special character'
+            ),
+            'code': 400,
+        }), 400
+
+    if MongoAPI.confirm_Password(current_user, encode_password(new_password)) != 'Yes':
+        return jsonify({'msg': 'Failed to change password', 'code': 400}), 400
+    return jsonify({'code': 200, 'msg': 'Password changed successfully'})
+
+
+@app.route('/mail_Signature', methods=['PUT'])
+@jwt_required()
+def update_mail_signature():
+    current_user, user, error = require_authenticated_user()
+    if error:
+        return error
+    if not request.is_json:
+        return jsonify({'msg': 'Missing JSON in request', 'code': 400}), 400
+
+    signature = request.json.get('mail_signature', '')
+    if not MongoAPI.update_user_mail_signature(current_user, signature):
+        return jsonify({'msg': 'Failed to save email signature', 'code': 400}), 400
+    return jsonify({'code': 200, 'msg': 'Email signature saved successfully'})
+
+
 @app.route('/roles', methods=['GET', 'POST'])
 @jwt_required()
 def roles():
-    current_user, user, org_id, error = require_manage_settings()
-    if error:
-        return error
-
     if request.method == 'GET':
+        current_user, user, error = require_authenticated_user()
+        if error:
+            return error
+        org_id = user.get('org_id')
         items = MongoAPI.roles_list(org_id)
         return jsonify({
             'code': 200,
-            'msg': 'Roles list',
+            'msg': 'Roles fetched successfully',
             'data': {'items': items},
         })
+
+    current_user, user, org_id, error = require_role_management()
+    if error:
+        return error
 
     if not request.is_json:
         return jsonify({'msg': 'Missing JSON in request', 'code': 400})
 
-    role_name = (request.json or {}).get('role_name')
+    payload = request.json or {}
+    role_name = payload.get('role_name')
     if not role_name:
         return jsonify({'msg': 'Missing role_name parameter', 'code': 400})
 
-    result = MongoAPI.role_create(org_id, current_user, role_name)
-    if result == 'missing_name':
-        return jsonify({'msg': 'Missing role_name parameter', 'code': 400})
-    if result == 'duplicate':
-        return jsonify({'msg': 'Role name already exists', 'code': 400})
-    if not result or result == '0':
-        return jsonify({'msg': 'Oops,Something went wrong !', 'code': 400})
+    result = MongoAPI.role_create(
+        org_id,
+        current_user,
+        role_name,
+        permissions=payload,
+        actor_user_id=current_user,
+    )
+    error_response = _role_mutation_error_response(result)
+    if error_response:
+        return error_response
 
-    role_data = MongoAPI.getRolesListDetails(org_id, result)
+    role_data = MongoAPI.get_role_detail(org_id, result)
     return jsonify({
         'code': 200,
-        'msg': 'Role successfully created !',
-        'data': Uid.fix_array_role(role_data),
+        'msg': 'Role created successfully',
+        'data': role_data,
     })
 
 
 @app.route('/roles/<role_id>', methods=['GET', 'PUT', 'DELETE'])
 @jwt_required()
 def role_detail(role_id):
-    current_user, user, org_id, error = require_manage_settings()
-    if error:
-        return error
-
     if request.method == 'GET':
-        role_data = MongoAPI.getRolesListDetails(org_id, role_id)
+        current_user, user, org_id, error = require_role_management()
+        if error:
+            return error
+
+        role_data = MongoAPI.get_role_detail(org_id, role_id)
         if not role_data:
             return jsonify({'msg': 'Role not found', 'code': 404}), 404
         return jsonify({
             'code': 200,
-            'msg': 'Role details',
-            'data': Uid.fix_array_role(role_data),
+            'msg': 'Role fetched successfully',
+            'data': role_data,
         })
 
+    current_user, user, org_id, error = require_role_management()
+    if error:
+        return error
+
     if request.method == 'DELETE':
-        result = MongoAPI.role_delete(org_id, role_id)
-        if result == 'protected':
-            return jsonify({'msg': 'Administrator role cannot be deleted', 'code': 400})
-        if result == 'in_use':
-            return jsonify({'msg': 'Role is assigned to users and cannot be deleted', 'code': 400})
-        if not result or result == '0':
-            return jsonify({'msg': 'Oops,Something went wrong !', 'code': 400})
-        return jsonify({'code': 200, 'msg': 'Role successfully deleted !'})
+        reassign_to = request.args.get('reassign_to')
+        result = MongoAPI.role_delete(org_id, role_id, reassign_to=reassign_to)
+        error_response = _role_mutation_error_response(result)
+        if error_response:
+            return error_response
+        return jsonify({
+            'code': 200,
+            'msg': 'Role deleted successfully',
+            'data': None,
+        })
 
     if not request.is_json:
         return jsonify({'msg': 'Missing JSON in request', 'code': 400})
 
     data = request.json or {}
     result = MongoAPI.role_update(org_id, role_id, data, actor_user_id=current_user)
-    if result == 'duplicate':
-        return jsonify({'msg': 'Role name already exists', 'code': 400})
-    if isinstance(result, str) and result not in ('0',) and len(result) != 24:
-        return jsonify({'msg': result, 'code': 403})
-    if not result or result == '0':
-        return jsonify({'msg': 'Oops,Something went wrong !', 'code': 400})
+    error_response = _role_mutation_error_response(result)
+    if error_response:
+        return error_response
 
-    role_data = MongoAPI.getRolesListDetails(org_id, role_id)
+    role_data = MongoAPI.get_role_detail(org_id, role_id)
     return jsonify({
         'code': 200,
-        'msg': 'Role successfully updated !',
-        'data': Uid.fix_array_role(role_data),
+        'msg': 'Role updated successfully',
+        'data': role_data,
+    })
+
+
+@app.route('/permissions/catalog', methods=['GET'])
+@jwt_required()
+def permissions_catalog():
+    current_user, user, error = require_authenticated_user()
+    if error:
+        return error
+
+    return jsonify({
+        'code': 200,
+        'msg': 'Success',
+        'data': PERMISSION_CATALOG,
     })
 
 
@@ -2900,7 +3470,20 @@ def branch_list():
     if not org_id:
         return jsonify({'msg': 'Oops,Something went wrong !', 'code': 400})
 
-    branches = MongoAPI.branch_list(org_id, actor=user)
+    # ?all=1 returns the full org catalog for branch/user management screens.
+    # Default keeps actor scoping used by filters / dropdowns.
+    want_all = str(request.args.get('all', '')).lower() in ('1', 'true', 'yes')
+    if want_all:
+        tier = effective_tier(user)
+        if tier not in ('super_admin', 'admin'):
+            return jsonify({
+                'msg': "You don't have access to manage branches",
+                'code': 403,
+            }), 403
+        branches = MongoAPI.branch_list(org_id, for_management=True)
+    else:
+        branches = MongoAPI.branch_list(org_id, actor=user)
+
     return jsonify({
         'code': 200,
         'msg': 'Branches list',
@@ -2931,10 +3514,7 @@ def add_branch():
     if not result or result == '0':
         return jsonify({'msg': 'Oops,Something went wrong !', 'code': 400})
 
-    branch_data = next(
-        (item for item in MongoAPI.branch_list(org_id) if item.get('id') == result),
-        {'id': result},
-    )
+    branch_data = MongoAPI._find_branch_payload(org_id, result)
     return jsonify({
         'code': 200,
         'msg': 'Branch successfully created !',
@@ -2959,10 +3539,7 @@ def branch_edit(branch_id):
     if not result or result == '0':
         return jsonify({'msg': 'Branch not found', 'code': 404})
 
-    branch_data = next(
-        (item for item in MongoAPI.branch_list(org_id) if item.get('id') == result),
-        {'id': result},
-    )
+    branch_data = MongoAPI._find_branch_payload(org_id, result)
     return jsonify({
         'code': 200,
         'msg': 'Branch successfully updated !',
@@ -2977,14 +3554,28 @@ def branch_delete(branch_id):
     if error:
         return error
 
-    result = MongoAPI.branch_deactivate(org_id, branch_id)
+    if request.method == 'DELETE':
+        status = 'inactive'
+    else:
+        data = request.get_json(silent=True, force=True) or {}
+        if not data and request.form:
+            data = request.form.to_dict()
+        status = data.get('status')
+        if status not in ('active', 'inactive'):
+            return jsonify({'msg': 'Invalid status. Use active or inactive', 'code': 400})
+
+    result = MongoAPI.branch_update(org_id, branch_id, {'status': status})
     if not result or result == '0':
         return jsonify({'msg': 'Branch not found', 'code': 404})
 
+    branch_data = MongoAPI._find_branch_payload(
+        org_id, result, fallback={'status': status}
+    )
+    action = 'activated' if status == 'active' else 'deactivated'
     return jsonify({
         'code': 200,
-        'msg': 'Branch successfully deactivated',
-        'data': {'id': result, 'status': 'inactive'},
+        'msg': f'Branch successfully {action}',
+        'data': branch_data,
     })
 
 
@@ -3009,6 +3600,80 @@ def user_permissions():
     })
 
 
+@app.route('/users/<user_id>/permissions', methods=['GET', 'PUT', 'OPTIONS'])
+@jwt_required(optional=True)
+def manage_user_permissions(user_id):
+    if request.method == 'OPTIONS':
+        return '', 204
+
+    current_user = get_jwt_identity()
+    if not current_user:
+        return jsonify({'msg': 'Authorization token is missing', 'code': 401}), 401
+
+    user = MongoAPI.authorizationCheck(current_user)
+    if not user:
+        return jsonify({'msg': 'Invalid user', 'code': 401}), 401
+
+    org_id = user.get('org_id')
+    role_data = MongoAPI.get_user_role_data(org_id, current_user)
+    if not can_manage_users(user, role_data):
+        return jsonify({
+            'msg': "You don't have access to manage users",
+            'code': 403,
+        }), 403
+
+    target = MongoAPI.getUserDetails(org_id, user_id)
+    if not target:
+        return jsonify({'msg': 'User not found', 'code': 404}), 404
+
+    if not can_manage_target_user(user, target):
+        return jsonify({
+            'msg': 'You cannot manage permissions for this user',
+            'code': 403,
+        }), 403
+
+    if request.method == 'GET':
+        data = MongoAPI.get_user_effective_permissions(org_id, user_id)
+        if not data:
+            return jsonify({'msg': 'Unable to load permissions', 'code': 400}), 400
+        return jsonify({
+            'code': 200,
+            'msg': 'User permissions fetched successfully',
+            'data': data,
+        })
+
+    if not request.is_json:
+        return jsonify({'msg': 'Missing JSON in request', 'code': 400})
+
+    payload = request.json or {}
+    permission_updates = flatten_role_permission_payload(payload)
+    if not permission_updates:
+        # Support single-key body like { "add_lead": 1 }
+        permission_updates = {
+            key: value
+            for key, value in payload.items()
+            if key in ALL_ROLE_KEYS
+        }
+
+    if not permission_updates:
+        return jsonify({'msg': 'Missing permission updates', 'code': 400})
+
+    for key, value in permission_updates.items():
+        result = MongoAPI.update_user_permission(
+            org_id, user_id, key, value, actor=user,
+        )
+        error_response = _role_mutation_error_response(result)
+        if error_response:
+            return error_response
+
+    data = MongoAPI.get_user_effective_permissions(org_id, user_id)
+    return jsonify({
+        'code': 200,
+        'msg': 'User permissions updated successfully',
+        'data': data,
+    })
+
+
 @app.route('/active_users_list', methods=['GET'])
 @jwt_required()
 def active_users_list():
@@ -3017,7 +3682,8 @@ def active_users_list():
         return error
 
     org_id = user.get('org_id')
-    users = MongoAPI.active_users_list(org_id)
+    branch_id = request.args.get('branch_id')
+    users = MongoAPI.active_users_list(org_id, actor=user, branch_id=branch_id)
     return jsonify({
         'code': 200,
         'msg': 'Active users list',
@@ -3392,26 +4058,16 @@ def users_gmailList():
 @app.route('/mail_signature_get', methods=['GET'])
 @jwt_required()
 def getmail_signature():
-    current_user = get_jwt_identity()
-    user = MongoAPI.authorizationCheck(current_user)
+    current_user, user, error = require_authenticated_user()
+    if error:
+        return error
 
-    ordId = ''
-    for user2 in user:
-        if user2=='org_id':
-            ordId = int(user[user2])
-
-    if ordId=='':
-        return jsonify({"msg": "Oops,Something went wrong !","code": 400})
-    else:
-        if ordId:
-            response1 = MongoAPI.getmail_signature(ordId)
-            response = Uid.fix_array(response1)
-            # data = {'template':response}
-
-            if response:
-                return jsonify({"msg": "Mail Signature!","code": 200,"data": response})
-            else:
-                return jsonify({"msg": "Oops,Something went wrong !","code": 400})
+    signature = MongoAPI.get_user_mail_signature(current_user)
+    return jsonify({
+        'code': 200,
+        'msg': 'Mail Signature!',
+        'data': [{'mail_signature': signature}],
+    })
 
 
 
@@ -3914,14 +4570,23 @@ def document():
         })
 
     original_filename = secure_filename(file.filename)
-    file_format = splitpart(file.filename, -1, '.')
-    file_name = splitpart(file.filename, 0, '.')
+    safe_base = original_filename.rsplit('.', 1)[0] if original_filename else 'file'
+    file_format = original_filename.rsplit('.', 1)[-1].lower() if '.' in original_filename else ''
+    if not file_format or file_format not in app_config.ALLOWED_EXTENSIONS:
+        return jsonify({
+            "msg": f"Allowed file types are {app_config.ALLOWED_EXTENSIONS}",
+            "code": 400,
+        })
     stored_filename = (
-        file_name + time.strftime('_%d_%Y_%H_%M_%S') + '.' + file_format
+        f"{safe_base}{time.strftime('_%d_%Y_%H_%M_%S')}.{file_format}"
     )
 
     upload_dir = app.config['UPLOAD_DOCUMENT_FOLDER']
-    file.save(os.path.join(upload_dir, stored_filename))
+    os.makedirs(upload_dir, exist_ok=True)
+    dest_path = os.path.realpath(os.path.join(upload_dir, stored_filename))
+    if not dest_path.startswith(os.path.realpath(upload_dir) + os.sep):
+        return jsonify({'msg': 'Invalid file name', 'code': 400})
+    file.save(dest_path)
 
     document_id = MongoAPI.documentSubmit(
         ord_id,
