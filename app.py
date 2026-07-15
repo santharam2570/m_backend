@@ -856,24 +856,28 @@ def forgot_password_check():
 
 
 @app.route('/creat_new_password', methods=['POST'])
-@jwt_required()
 def creat_new_password():
+    """Set a new password from the reset-password page (no JWT).
+
+    Expected body: { "user_id": "...", "new_password": "..." }
+    Used after forgot-password / email deep link with user_id.
+    """
     if not request.is_json:
         return jsonify({'msg': 'Missing JSON in request', 'code': 400})
 
-    current_user = get_jwt_identity()
     new_password = request.json.get('new_password')
-    user_id = request.json.get('user_id') or current_user
+    user_id = request.json.get('user_id')
 
     if not new_password:
         return jsonify({'msg': 'Missing new password parameter', 'code': 400})
-    if str(user_id) != str(current_user):
-        return jsonify({'msg': 'You can only reset your own password', 'code': 403})
+    if not user_id:
+        return jsonify({'msg': 'Missing user_id parameter', 'code': 400})
+
+    user = MongoAPI.authorizationCheck(user_id)
+    if not user:
+        return jsonify({'msg': 'Invalid user', 'code': 400})
 
     if MongoAPI.confirm_Password(user_id, encode_password(new_password)) == 'Yes':
-        user = MongoAPI.authorizationCheck(user_id)
-        if not user:
-            return jsonify({'msg': 'User password successfully updated !', 'code': 200})
         org_id = user.get('org_id')
         return jsonify({
             'msg': 'User password successfully updated !',
